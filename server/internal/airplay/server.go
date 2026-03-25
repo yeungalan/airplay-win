@@ -64,7 +64,7 @@ func DefaultConfig() ServerConfig {
 		DeviceID:     generateMACAddress(),
 		Model:        "AppleTV6,2",
 		SrcVersion:   "380.20.1",
-		Features:     FeatureVideo | FeaturePhoto | FeatureVideoVolumeControl | FeatureVideoHTTPLiveStreams | FeatureSlideshow | FeatureScreen | FeatureScreenRotate | FeatureAudio | FeatureAudioRedundant | FeaturePhotoCaching | FeatureMetadataText | FeatureMetadataArtwork | FeatureMetadataProgress | FeatureLegacyPairing | FeatureRAOP,
+		Features:     FeatureVideo | FeaturePhoto | FeatureVideoVolumeControl | FeatureVideoHTTPLiveStreams | FeatureSlideshow | FeatureScreen | FeatureScreenRotate | FeatureAudio | FeatureAudioRedundant | FeaturePhotoCaching | FeatureMetadataText | FeatureMetadataArtwork | FeatureMetadataProgress | FeatureLegacyPairing | FeatureRAOP | FeatureTransientPairing,
 		StatusFlags:  0x10644,
 		Port:         7000,
 		MirrorPort:   7100,
