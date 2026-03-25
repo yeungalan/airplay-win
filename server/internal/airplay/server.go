@@ -55,6 +55,7 @@ type ServerConfig struct {
 	Width      int
 	Height     int
 	PIN        string
+	UIPort     int
 }
 
 func DefaultConfig() ServerConfig {
@@ -71,6 +72,7 @@ func DefaultConfig() ServerConfig {
 		Width:        1920,
 		Height:       1080,
 		PIN:          "3939",
+		UIPort:       8080,
 	}
 }
 
@@ -133,16 +135,31 @@ func NewServer(cfg ServerConfig) *Server {
 }
 
 func (s *Server) Start() error {
-	log.Printf("Starting AirPlay server '%s' on ports %d (airplay), %d (mirror), %d (audio)",
-		s.Config.Name, s.Config.Port, s.Config.MirrorPort, s.Config.AirTunesPort)
+	log.Printf("Starting AirPlay server '%s' on ports %d (airplay), %d (ui), %d (mirror), %d (audio)",
+		s.Config.Name, s.Config.Port, s.Config.UIPort, s.Config.MirrorPort, s.Config.AirTunesPort)
 
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 
-	// Main AirPlay HTTP server (port 7000)
+	// Main AirPlay HTTP server (port 7000) - protocol only
 	go func() {
-		mux := s.BuildAirPlayMux(s.StaticFS)
+		mux := s.buildAirPlayMux()
 		addr := fmt.Sprintf(":%d", s.Config.Port)
 		log.Printf("AirPlay HTTP server listening on %s", addr)
+		errCh <- http.ListenAndServe(addr, mux)
+	}()
+
+	// UI server (port 8080) - frontend + websocket + API
+	go func() {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/api/ws", s.handleWebSocket)
+		mux.HandleFunc("/api/status", s.handleAPIStatus)
+		mux.HandleFunc("/api/photo", s.handleAPIPhoto)
+		if s.StaticFS != nil {
+			fileServer := http.FileServer(http.FS(s.StaticFS))
+			mux.Handle("/", fileServer)
+		}
+		addr := fmt.Sprintf(":%d", s.Config.UIPort)
+		log.Printf("UI server listening on %s", addr)
 		errCh <- http.ListenAndServe(addr, mux)
 	}()
 

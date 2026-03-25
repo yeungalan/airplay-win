@@ -15,7 +15,8 @@ import (
 
 func main() {
 	name := flag.String("name", "AirPlay Server", "Server display name")
-	port := flag.Int("port", 7000, "AirPlay HTTP port")
+	port := flag.Int("port", 7000, "AirPlay protocol port")
+	uiPort := flag.Int("ui-port", 8080, "Frontend UI port")
 	mirrorPort := flag.Int("mirror-port", 7100, "Mirror port")
 	audioPort := flag.Int("audio-port", 5000, "RTSP/Audio port")
 	width := flag.Int("width", 1920, "Display width")
@@ -26,6 +27,7 @@ func main() {
 	cfg := airplay.DefaultConfig()
 	cfg.Name = *name
 	cfg.Port = *port
+	cfg.UIPort = *uiPort
 	cfg.MirrorPort = *mirrorPort
 	cfg.AirTunesPort = *audioPort
 	cfg.Width = *width
@@ -34,7 +36,6 @@ func main() {
 
 	server := airplay.NewServer(cfg)
 
-	// Embed the frontend static files
 	staticFS, err := fs.Sub(frontend.StaticFiles, "dist")
 	if err != nil {
 		log.Printf("Warning: could not load embedded frontend: %v", err)
@@ -42,7 +43,6 @@ func main() {
 		server.StaticFS = staticFS
 	}
 
-	// Start mDNS discovery
 	mdnsSvc := mdns.NewMDNSService(
 		cfg.Name, cfg.DeviceID, cfg.Model, cfg.SrcVersion,
 		airplay.GetPublicKeyHex(), cfg.Features, cfg.StatusFlags,
@@ -56,8 +56,8 @@ func main() {
 	log.Printf("=== AirPlay Server ===")
 	log.Printf("Name:       %s", cfg.Name)
 	log.Printf("Device ID:  %s", cfg.DeviceID)
-	log.Printf("Local IP:   %s", localIP)
-	log.Printf("UI + API:   http://%s:%d", localIP, cfg.Port)
+	log.Printf("AirPlay:    %s:%d", localIP, cfg.Port)
+	log.Printf("UI:         http://%s:%d", localIP, cfg.UIPort)
 	log.Printf("Mirror:     %s:%d", localIP, cfg.MirrorPort)
 	log.Printf("Audio:      %s:%d", localIP, cfg.AirTunesPort)
 	log.Printf("PIN:        %s", cfg.PIN)
