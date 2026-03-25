@@ -3,6 +3,7 @@ package airplay
 import (
 	"encoding/binary"
 	"fmt"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -103,6 +104,7 @@ type Server struct {
 	AudioCh   chan []byte // Audio data
 	EventCh   chan Event  // Events to frontend via WebSocket
 	PairState *PairingState
+	StaticFS  fs.FS       // Embedded frontend files
 	stopCh    chan struct{}
 }
 
@@ -138,7 +140,7 @@ func (s *Server) Start() error {
 
 	// Main AirPlay HTTP server (port 7000)
 	go func() {
-		mux := s.buildAirPlayMux()
+		mux := s.BuildAirPlayMux(s.StaticFS)
 		addr := fmt.Sprintf(":%d", s.Config.Port)
 		log.Printf("AirPlay HTTP server listening on %s", addr)
 		errCh <- http.ListenAndServe(addr, mux)

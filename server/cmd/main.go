@@ -2,12 +2,14 @@ package main
 
 import (
 	"flag"
+	"io/fs"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/airplay-win/server/internal/airplay"
+	"github.com/airplay-win/server/internal/frontend"
 	"github.com/airplay-win/server/internal/mdns"
 )
 
@@ -32,22 +34,22 @@ func main() {
 
 	server := airplay.NewServer(cfg)
 
+	// Embed the frontend static files
+	staticFS, err := fs.Sub(frontend.StaticFiles, "dist")
+	if err != nil {
+		log.Printf("Warning: could not load embedded frontend: %v", err)
+	} else {
+		server.StaticFS = staticFS
+	}
+
 	// Start mDNS discovery
 	mdnsSvc := mdns.NewMDNSService(
-		cfg.Name,
-		cfg.DeviceID,
-		cfg.Model,
-		cfg.SrcVersion,
-		airplay.GetPublicKeyHex(),
-		cfg.Features,
-		cfg.StatusFlags,
-		cfg.Port,
-		cfg.AirTunesPort,
+		cfg.Name, cfg.DeviceID, cfg.Model, cfg.SrcVersion,
+		airplay.GetPublicKeyHex(), cfg.Features, cfg.StatusFlags,
+		cfg.Port, cfg.AirTunesPort,
 	)
-
 	if err := mdnsSvc.Start(); err != nil {
 		log.Printf("Warning: mDNS registration failed: %v", err)
-		log.Printf("The server will still work but won't be auto-discoverable")
 	}
 
 	localIP := mdns.GetLocalIP()
@@ -55,17 +57,14 @@ func main() {
 	log.Printf("Name:       %s", cfg.Name)
 	log.Printf("Device ID:  %s", cfg.DeviceID)
 	log.Printf("Local IP:   %s", localIP)
-	log.Printf("AirPlay:    http://%s:%d", localIP, cfg.Port)
+	log.Printf("UI + API:   http://%s:%d", localIP, cfg.Port)
 	log.Printf("Mirror:     %s:%d", localIP, cfg.MirrorPort)
 	log.Printf("Audio:      %s:%d", localIP, cfg.AirTunesPort)
-	log.Printf("Frontend:   http://localhost:3000")
 	log.Printf("PIN:        %s", cfg.PIN)
 	log.Printf("======================")
 
-	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
 	go func() {
 		<-sigCh
 		log.Printf("Shutting down...")

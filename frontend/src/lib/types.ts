@@ -15,7 +15,7 @@ export interface ServerStatus {
   rate: number;
   width: number;
   height: number;
-  uptime?: number;
+  pin?: string;
 }
 
 export type ConnectionState = "connecting" | "connected" | "disconnected";

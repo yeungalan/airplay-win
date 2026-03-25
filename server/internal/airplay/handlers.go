@@ -5,11 +5,29 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
 )
+
+func (s *Server) BuildAirPlayMux(staticFS fs.FS) *http.ServeMux {
+	mux := s.buildAirPlayMux()
+
+	// Serve embedded frontend as fallback
+	if staticFS != nil {
+		fileServer := http.FileServer(http.FS(staticFS))
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			// Let API/AirPlay routes take priority (they're registered explicitly)
+			// This only fires for unmatched routes = frontend assets
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			fileServer.ServeHTTP(w, r)
+		})
+	}
+
+	return mux
+}
 
 func (s *Server) buildAirPlayMux() *http.ServeMux {
 	mux := http.NewServeMux()
