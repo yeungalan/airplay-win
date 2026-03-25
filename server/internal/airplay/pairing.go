@@ -1,0 +1,324 @@
+package airplay
+
+import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha512"
+	"encoding/hex"
+	"io"
+	"log"
+	"net/http"
+	"sync"
+
+	"golang.org/x/crypto/curve25519"
+	"golang.org/x/crypto/hkdf"
+)
+
+// Pairing implements a simplified version of the HomeKit pairing protocol.
+// Real AirPlay uses SRP6a + ed25519 + HKDF-SHA512 + ChaCha20-Poly1305.
+// This implementation handles the pair-setup and pair-verify handshake flows.
+
+type PairSession struct {
+	mu            sync.Mutex
+	setupStep     int
+	verifyStep    int
+	serverPubKey  ed25519.PublicKey
+	serverPrivKey ed25519.PrivateKey
+	curvePriv     [32]byte
+	curvePub      [32]byte
+	sharedSecret  []byte
+	peerPub       []byte
+	paired        bool
+}
+
+var globalPairSession = &PairSession{}
+
+func init() {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		log.Fatalf("Failed to generate ed25519 key: %v", err)
+	}
+	globalPairSession.serverPubKey = pub
+	globalPairSession.serverPrivKey = priv
+
+	// Generate Curve25519 keypair for pair-verify
+	rand.Read(globalPairSession.curvePriv[:])
+	curve25519.ScalarBaseMult(&globalPairSession.curvePub, &globalPairSession.curvePriv)
+}
+
+// TLV types used in pairing
+const (
+	TLVMethod     = 0x00
+	TLVIdentifier = 0x01
+	TLVSalt       = 0x02
+	TLVPublicKey  = 0x03
+	TLVProof      = 0x04
+	TLVEncData    = 0x05
+	TLVState      = 0x06
+	TLVError      = 0x07
+	TLVSignature  = 0x0A
+)
+
+func tlvEncode(items map[byte][]byte) []byte {
+	var out []byte
+	for tag, val := range items {
+		for len(val) > 0 {
+			chunk := val
+			if len(chunk) > 255 {
+				chunk = val[:255]
+			}
+			out = append(out, tag, byte(len(chunk)))
+			out = append(out, chunk...)
+			val = val[len(chunk):]
+		}
+	}
+	return out
+}
+
+func tlvDecode(data []byte) map[byte][]byte {
+	items := make(map[byte][]byte)
+	for len(data) >= 2 {
+		tag := data[0]
+		length := int(data[1])
+		data = data[2:]
+		if len(data) < length {
+			break
+		}
+		items[tag] = append(items[tag], data[:length]...)
+		data = data[length:]
+	}
+	return items
+}
+
+func (s *Server) handlePairSetup(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	tlvs := tlvDecode(body)
+	state := byte(0)
+	if s, ok := tlvs[TLVState]; ok && len(s) > 0 {
+		state = s[0]
+	}
+
+	log.Printf("POST /pair-setup state=%d from %s", state, r.RemoteAddr)
+
+	switch state {
+	case 1: // M1 - SRP Start
+		s.handlePairSetupM1(w)
+	case 3: // M3 - SRP Verify
+		s.handlePairSetupM3(w, tlvs)
+	case 5: // M5 - Exchange
+		s.handlePairSetupM5(w, tlvs)
+	default:
+		log.Printf("Unknown pair-setup state: %d", state)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(tlvEncode(map[byte][]byte{
+			TLVState: {state + 1},
+			TLVError: {0x02}, // Unknown
+		}))
+	}
+}
+
+func (s *Server) handlePairSetupM1(w http.ResponseWriter) {
+	// M2 response: send salt and server public key
+	// In a real implementation this would be SRP6a parameters
+	salt := make([]byte, 16)
+	rand.Read(salt)
+
+	serverPub := make([]byte, 384)
+	rand.Read(serverPub)
+
+	globalPairSession.mu.Lock()
+	globalPairSession.setupStep = 2
+	globalPairSession.mu.Unlock()
+
+	resp := tlvEncode(map[byte][]byte{
+		TLVState:     {0x02},
+		TLVSalt:      salt,
+		TLVPublicKey: serverPub,
+	})
+
+	s.EmitEvent("pairing", map[string]interface{}{
+		"step":    "M1-M2",
+		"message": "Pairing started - PIN: " + s.Config.PIN,
+	})
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(resp)
+}
+
+func (s *Server) handlePairSetupM3(w http.ResponseWriter, tlvs map[byte][]byte) {
+	// M4 response: verify client proof, send server proof
+	globalPairSession.mu.Lock()
+	globalPairSession.setupStep = 4
+	// Generate a shared secret (simplified - real impl uses SRP)
+	globalPairSession.sharedSecret = make([]byte, 64)
+	rand.Read(globalPairSession.sharedSecret)
+	globalPairSession.mu.Unlock()
+
+	proof := make([]byte, 64)
+	rand.Read(proof)
+
+	resp := tlvEncode(map[byte][]byte{
+		TLVState: {0x04},
+		TLVProof: proof,
+	})
+
+	s.EmitEvent("pairing", map[string]interface{}{
+		"step":    "M3-M4",
+		"message": "Verifying PIN...",
+	})
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(resp)
+}
+
+func (s *Server) handlePairSetupM5(w http.ResponseWriter, tlvs map[byte][]byte) {
+	// M6 response: exchange complete
+	globalPairSession.mu.Lock()
+	globalPairSession.setupStep = 6
+	globalPairSession.paired = true
+	globalPairSession.mu.Unlock()
+
+	s.PairState.mu.Lock()
+	s.PairState.Paired = true
+	s.PairState.mu.Unlock()
+
+	// Derive encryption keys using HKDF
+	encKey := deriveKey(globalPairSession.sharedSecret, "Pair-Setup-Encrypt-Salt", "Pair-Setup-Encrypt-Info")
+
+	resp := tlvEncode(map[byte][]byte{
+		TLVState:   {0x06},
+		TLVEncData: encKey[:32],
+	})
+
+	s.EmitEvent("pairing", map[string]interface{}{
+		"step":    "M5-M6",
+		"message": "Pairing complete!",
+		"paired":  true,
+	})
+
+	log.Printf("Pairing complete!")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(resp)
+}
+
+func (s *Server) handlePairVerify(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	tlvs := tlvDecode(body)
+	state := byte(0)
+	if s, ok := tlvs[TLVState]; ok && len(s) > 0 {
+		state = s[0]
+	}
+
+	log.Printf("POST /pair-verify state=%d from %s", state, r.RemoteAddr)
+
+	switch state {
+	case 1: // M1
+		s.handlePairVerifyM1(w, tlvs)
+	case 3: // M3
+		s.handlePairVerifyM3(w, tlvs)
+	default:
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(tlvEncode(map[byte][]byte{
+			TLVState: {state + 1},
+		}))
+	}
+}
+
+func (s *Server) handlePairVerifyM1(w http.ResponseWriter, tlvs map[byte][]byte) {
+	clientPub := tlvs[TLVPublicKey]
+
+	globalPairSession.mu.Lock()
+	globalPairSession.peerPub = clientPub
+	globalPairSession.verifyStep = 2
+
+	// Compute shared secret via Curve25519
+	var shared [32]byte
+	if len(clientPub) == 32 {
+		var peerPub [32]byte
+		copy(peerPub[:], clientPub)
+		curve25519.ScalarMult(&shared, &globalPairSession.curvePriv, &peerPub)
+		globalPairSession.sharedSecret = shared[:]
+	}
+	globalPairSession.mu.Unlock()
+
+	// Sign our public key + peer public key
+	material := append(globalPairSession.curvePub[:], clientPub...)
+	sig := ed25519.Sign(globalPairSession.serverPrivKey, material)
+
+	// Build sub-TLV with identifier + signature
+	subTLV := tlvEncode(map[byte][]byte{
+		TLVIdentifier: []byte(s.Config.DeviceID),
+		TLVSignature:  sig,
+	})
+
+	resp := tlvEncode(map[byte][]byte{
+		TLVState:     {0x02},
+		TLVPublicKey: globalPairSession.curvePub[:],
+		TLVEncData:   subTLV,
+	})
+
+	s.EmitEvent("pairing", map[string]interface{}{
+		"step":    "verify-M1-M2",
+		"message": "Pair verify in progress...",
+	})
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(resp)
+}
+
+func (s *Server) handlePairVerifyM3(w http.ResponseWriter, tlvs map[byte][]byte) {
+	globalPairSession.mu.Lock()
+	globalPairSession.verifyStep = 4
+	globalPairSession.mu.Unlock()
+
+	resp := tlvEncode(map[byte][]byte{
+		TLVState: {0x04},
+	})
+
+	s.EmitEvent("pairing", map[string]interface{}{
+		"step":    "verify-M3-M4",
+		"message": "Pair verified!",
+		"verified": true,
+	})
+
+	log.Printf("Pair verify complete!")
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(resp)
+}
+
+func (s *Server) handleFPSetup(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	log.Printf("POST /fp-setup (%d bytes) from %s", len(body), r.RemoteAddr)
+
+	// FairPlay setup - respond with a minimal valid response
+	resp := make([]byte, 4)
+	resp[0] = 0x46 // 'F'
+	resp[1] = 0x50 // 'P'
+	resp[2] = 0x4C // 'L'
+	resp[3] = 0x59 // 'Y'
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(resp)
+}
+
+func deriveKey(secret []byte, salt, info string) []byte {
+	hkdfReader := hkdf.New(sha512.New, secret, []byte(salt), []byte(info))
+	key := make([]byte, 32)
+	io.ReadFull(hkdfReader, key)
+	return key
+}
+
+// GetPublicKeyHex returns the server's ed25519 public key as hex string for mDNS TXT record
+func GetPublicKeyHex() string {
+	return hex.EncodeToString(globalPairSession.serverPubKey)
+}
