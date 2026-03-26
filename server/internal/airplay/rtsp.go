@@ -2,14 +2,12 @@ package airplay
 
 import (
 	"bufio"
-<<<<<<< Updated upstream
-=======
 	"crypto/ed25519"
 	"crypto/rand"
->>>>>>> Stashed changes
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"strconv"
 	"strings"
@@ -104,7 +102,7 @@ func (s *Server) handleRTSPConnection(conn net.Conn) {
 			respHeaders = map[string]string{
 				"Transport": fmt.Sprintf("RTP/AVP/UDP;unicast;mode=record;server_port=%d;control_port=%d;timing_port=%d",
 					s.Config.AirTunesPort+1, s.Config.AirTunesPort+2, s.Config.AirTunesPort+3),
-				"Session": "1",
+				"Session":           "1",
 				"Audio-Jack-Status": "connected; type=analog",
 			}
 
@@ -152,25 +150,64 @@ func (s *Server) handleRTSPPairSetup(conn net.Conn, req *RTSPRequest) {
 	var resp []byte
 	switch state {
 	case 1:
-		salt := make([]byte, 16)
-		serverPub := make([]byte, 384)
+		// M2: real SRP-6a parameters
+		salt := srpNewSalt()
+		v := srpVerifier(salt, s.Config.PIN)
+		bPriv, bPub := srpServerKeys(v)
+
+		globalPairSession.mu.Lock()
+		globalPairSession.setupStep = 2
+		globalPairSession.srpSalt = salt
+		globalPairSession.srpV = v
+		globalPairSession.srpBPriv = bPriv
+		globalPairSession.srpBPub = bPub
+		globalPairSession.mu.Unlock()
+
 		resp = tlvEncode(map[byte][]byte{
 			TLVState:     {0x02},
 			TLVSalt:      salt,
-			TLVPublicKey: serverPub,
+			TLVPublicKey: srpPad(bPub),
 		})
+
+		s.EmitEvent("pairing", map[string]interface{}{
+			"step":    "M1-M2",
+			"message": "Pairing started - PIN: " + s.Config.PIN,
+		})
+
 	case 3:
-		proof := make([]byte, 64)
+		// M4: compute session key, send server proof
+		aBytes := tlvs[TLVPublicKey]
+		m1Client := tlvs[TLVProof]
+
+		globalPairSession.mu.Lock()
+		bPriv := globalPairSession.srpBPriv
+		bPub := globalPairSession.srpBPub
+		v := globalPairSession.srpV
+
+		var m2 []byte
+		var K []byte
+		if bPriv != nil && bPub != nil && v != nil && len(aBytes) > 0 {
+			A := new(big.Int).SetBytes(aBytes)
+			K = srpSessionKey(A, bPub, bPriv, v)
+			if K != nil {
+				m2 = srpServerProof(A, m1Client, K)
+			}
+		}
+		if m2 == nil {
+			m2 = make([]byte, 64)
+			rand.Read(m2)
+		}
+		globalPairSession.setupStep = 4
+		globalPairSession.sharedSecret = K
+		globalPairSession.srpK = K
+		globalPairSession.mu.Unlock()
+
 		resp = tlvEncode(map[byte][]byte{
 			TLVState: {0x04},
-			TLVProof: proof,
+			TLVProof: m2,
 		})
+
 	case 5:
-<<<<<<< Updated upstream
-		resp = tlvEncode(map[byte][]byte{
-			TLVState: {0x06},
-		})
-=======
 		globalPairSession.mu.Lock()
 		srpK := globalPairSession.srpK
 		globalPairSession.setupStep = 6
@@ -183,7 +220,6 @@ func (s *Server) handleRTSPPairSetup(conn net.Conn, req *RTSPRequest) {
 		s.EmitEvent("pairing", map[string]interface{}{"step": "M5-M6", "message": "Pairing complete!", "paired": true})
 		encData := buildPairSetupM6(srpK, s.Config.DeviceID, globalPairSession.serverPrivKey, globalPairSession.serverPubKey)
 		resp = tlvEncode(map[byte][]byte{TLVState: {0x06}, TLVEncData: encData})
->>>>>>> Stashed changes
 	default:
 		resp = tlvEncode(map[byte][]byte{
 			TLVState: {state + 1},
