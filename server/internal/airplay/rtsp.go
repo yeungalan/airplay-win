@@ -41,9 +41,11 @@ func (e *sessionEncryption) Read(b []byte) (int, error) {
 	}
 	var lenBuf [2]byte
 	if _, err := io.ReadFull(e.conn, lenBuf[:]); err != nil {
+		log.Printf("Session enc: read length error (nonce=%d): %v", e.readNonce, err)
 		return 0, err
 	}
 	plen := int(binary.LittleEndian.Uint16(lenBuf[:]))
+	log.Printf("Session enc: reading frame plen=%d nonce=%d", plen, e.readNonce)
 	encrypted := make([]byte, plen+16)
 	if _, err := io.ReadFull(e.conn, encrypted); err != nil {
 		return 0, err
@@ -54,8 +56,10 @@ func (e *sessionEncryption) Read(b []byte) (int, error) {
 	aead, _ := chacha20poly1305.New(e.readKey)
 	plaintext, err := aead.Open(nil, nonce[:], encrypted, lenBuf[:])
 	if err != nil {
+		log.Printf("Session enc: decrypt FAILED nonce=%d plen=%d err=%v", e.readNonce-1, plen, err)
 		return 0, fmt.Errorf("session decrypt: %w", err)
 	}
+	log.Printf("Session enc: decrypted %d bytes: %.80q", len(plaintext), plaintext)
 	n := copy(b, plaintext)
 	if n < len(plaintext) {
 		e.readBuf = make([]byte, len(plaintext)-n)
@@ -111,9 +115,7 @@ func (s *Server) handleRTSPConnection(conn net.Conn) {
 	for {
 		req, err := readRTSPRequest(reader)
 		if err != nil {
-			if err != io.EOF {
-				log.Printf("RTSP read error: %v", err)
-			}
+			log.Printf("RTSP read error (encrypted=%v): %v", writer != conn, err)
 			return
 		}
 
