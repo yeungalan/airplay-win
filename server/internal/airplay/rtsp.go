@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,80 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 )
+
+// sessionEncryption wraps a net.Conn with HAP ChaCha20-Poly1305 session encryption.
+// After pair-verify M4, all RTSP traffic is framed as:
+//
+//	[2-byte LE plaintext length][ciphertext][16-byte Poly1305 tag]
+//
+// The 2-byte length is also the AAD. The nonce is an 8-byte LE counter
+// zero-padded to 12 bytes (bytes 0-3 = 0, bytes 4-11 = counter LE).
+type sessionEncryption struct {
+	conn       net.Conn
+	readKey    []byte
+	writeKey   []byte
+	readNonce  uint64
+	writeNonce uint64
+	readBuf    []byte
+}
+
+func (e *sessionEncryption) Read(b []byte) (int, error) {
+	if len(e.readBuf) > 0 {
+		n := copy(b, e.readBuf)
+		e.readBuf = e.readBuf[n:]
+		return n, nil
+	}
+	var lenBuf [2]byte
+	if _, err := io.ReadFull(e.conn, lenBuf[:]); err != nil {
+		return 0, err
+	}
+	plen := int(binary.LittleEndian.Uint16(lenBuf[:]))
+	encrypted := make([]byte, plen+16)
+	if _, err := io.ReadFull(e.conn, encrypted); err != nil {
+		return 0, err
+	}
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[4:], e.readNonce)
+	e.readNonce++
+	aead, _ := chacha20poly1305.New(e.readKey)
+	plaintext, err := aead.Open(nil, nonce[:], encrypted, lenBuf[:])
+	if err != nil {
+		return 0, fmt.Errorf("session decrypt: %w", err)
+	}
+	n := copy(b, plaintext)
+	if n < len(plaintext) {
+		e.readBuf = make([]byte, len(plaintext)-n)
+		copy(e.readBuf, plaintext[n:])
+	}
+	return n, nil
+}
+
+func (e *sessionEncryption) Write(b []byte) (int, error) {
+	const maxBlock = 1024
+	total := 0
+	for len(b) > 0 {
+		block := b
+		if len(block) > maxBlock {
+			block = b[:maxBlock]
+		}
+		b = b[len(block):]
+		var lenBuf [2]byte
+		binary.LittleEndian.PutUint16(lenBuf[:], uint16(len(block)))
+		var nonce [12]byte
+		binary.LittleEndian.PutUint64(nonce[4:], e.writeNonce)
+		e.writeNonce++
+		aead, _ := chacha20poly1305.New(e.writeKey)
+		encrypted := aead.Seal(nil, nonce[:], block, lenBuf[:])
+		frame := make([]byte, 2+len(encrypted))
+		copy(frame, lenBuf[:])
+		copy(frame[2:], encrypted)
+		if _, err := e.conn.Write(frame); err != nil {
+			return total, err
+		}
+		total += len(block)
+	}
+	return total, nil
+}
 
 // RTSP request parsed from raw TCP
 type RTSPRequest struct {
@@ -31,6 +106,7 @@ func (s *Server) handleRTSPConnection(conn net.Conn) {
 	log.Printf("RTSP connection from %s", conn.RemoteAddr())
 
 	reader := bufio.NewReader(conn)
+	var writer io.Writer = conn // switches to sessionEncryption after pair-verify M4
 
 	for {
 		req, err := readRTSPRequest(reader)
@@ -83,7 +159,21 @@ func (s *Server) handleRTSPConnection(conn net.Conn) {
 			continue
 
 		case req.Method == "POST" && strings.HasSuffix(req.URI, "/pair-verify"):
-			s.handleRTSPPairVerify(conn, req)
+			if s.handleRTSPPairVerify(conn, req) {
+				// Pair-verify M4 just sent — upgrade connection to session encryption.
+				// Controller→Accessory uses "Control-Write-Encryption-Key" (our read key).
+				// Accessory→Controller uses "Control-Read-Encryption-Key" (our write key).
+				globalPairSession.mu.Lock()
+				sharedSecret := make([]byte, len(globalPairSession.sharedSecret))
+				copy(sharedSecret, globalPairSession.sharedSecret)
+				globalPairSession.mu.Unlock()
+				readKey := deriveKey(sharedSecret, "Control-Salt", "Control-Write-Encryption-Key")
+				writeKey := deriveKey(sharedSecret, "Control-Salt", "Control-Read-Encryption-Key")
+				enc := &sessionEncryption{conn: conn, readKey: readKey, writeKey: writeKey}
+				reader = bufio.NewReader(enc)
+				writer = enc
+				log.Printf("RTSP session encrypted")
+			}
 			continue
 
 		case req.Method == "ANNOUNCE":
@@ -134,7 +224,7 @@ func (s *Server) handleRTSPConnection(conn net.Conn) {
 			log.Printf("Unhandled RTSP: %s %s", req.Method, req.URI)
 		}
 
-		writeRTSPResponse(conn, status, req.CSeq, respHeaders, respBody)
+		writeRTSPResponse(writer, status, req.CSeq, respHeaders, respBody)
 	}
 }
 
@@ -231,7 +321,10 @@ func (s *Server) handleRTSPPairSetup(conn net.Conn, req *RTSPRequest) {
 	}, string(resp))
 }
 
-func (s *Server) handleRTSPPairVerify(conn net.Conn, req *RTSPRequest) {
+// handleRTSPPairVerify handles pair-verify M1 and M3.
+// Returns true when M4 (state=3 response) has been written — caller must
+// immediately upgrade the connection to session encryption.
+func (s *Server) handleRTSPPairVerify(conn net.Conn, req *RTSPRequest) bool {
 	tlvs := tlvDecode(req.Body)
 	state := byte(0)
 	if st, ok := tlvs[TLVState]; ok && len(st) > 0 {
@@ -282,19 +375,24 @@ func (s *Server) handleRTSPPairVerify(conn net.Conn, req *RTSPRequest) {
 			TLVPublicKey: ephPub[:],
 			TLVEncData:   encData,
 		})
+
 	case 3:
-		resp = tlvEncode(map[byte][]byte{
-			TLVState: {0x04},
-		})
+		// M4: pair-verify complete. Write M4 plaintext, then caller upgrades to encrypted.
+		resp = tlvEncode(map[byte][]byte{TLVState: {0x04}})
+		writeRTSPResponse(conn, "200 OK", req.CSeq, map[string]string{
+			"Content-Type": "application/octet-stream",
+		}, string(resp))
+		log.Printf("RTSP pair-verify complete, upgrading to session encryption")
+		return true
+
 	default:
-		resp = tlvEncode(map[byte][]byte{
-			TLVState: {state + 1},
-		})
+		resp = tlvEncode(map[byte][]byte{TLVState: {state + 1}})
 	}
 
 	writeRTSPResponse(conn, "200 OK", req.CSeq, map[string]string{
 		"Content-Type": "application/octet-stream",
 	}, string(resp))
+	return false
 }
 
 func (s *Server) handleRTSPSetParameter(req *RTSPRequest) {
@@ -384,7 +482,7 @@ func readRTSPRequest(reader *bufio.Reader) (*RTSPRequest, error) {
 	return req, nil
 }
 
-func writeRTSPResponse(conn net.Conn, status, cseq string, headers map[string]string, body string) {
+func writeRTSPResponse(w io.Writer, status, cseq string, headers map[string]string, body string) {
 	resp := fmt.Sprintf("RTSP/1.0 %s\r\n", status)
 	if cseq != "" {
 		resp += fmt.Sprintf("CSeq: %s\r\n", cseq)
@@ -395,5 +493,5 @@ func writeRTSPResponse(conn net.Conn, status, cseq string, headers map[string]st
 	}
 	resp += "\r\n"
 	resp += body
-	conn.Write([]byte(resp))
+	w.Write([]byte(resp))
 }
