@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sync"
 
+	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
 )
@@ -88,6 +89,22 @@ func tlvDecode(data []byte) map[byte][]byte {
 		data = data[length:]
 	}
 	return items
+}
+
+func buildPairSetupM6(srpK []byte, deviceID string, privKey ed25519.PrivateKey, pubKey ed25519.PublicKey) []byte {
+	encKey := deriveKey(srpK, "Pair-Setup-Encrypt-Salt", "Pair-Setup-Encrypt-Info")
+	serverX := deriveKey(srpK, "Pair-Setup-Accessory-Sign-Salt", "Pair-Setup-Accessory-Sign-Info")
+	sigMaterial := append(append(serverX, []byte(deviceID)...), pubKey...)
+	sig := ed25519.Sign(privKey, sigMaterial)
+	inner := tlvEncode(map[byte][]byte{
+		TLVIdentifier: []byte(deviceID),
+		TLVPublicKey:  pubKey,
+		TLVSignature:  sig,
+	})
+	nonce := [12]byte{}
+	copy(nonce[4:], "PS-Msg06")
+	aead, _ := chacha20poly1305.New(encKey)
+	return aead.Seal(nil, nonce[:], inner, nil)
 }
 
 func (s *Server) handlePairSetup(w http.ResponseWriter, r *http.Request) {
@@ -179,6 +196,7 @@ func (s *Server) handlePairSetupM3(w http.ResponseWriter, tlvs map[byte][]byte) 
 func (s *Server) handlePairSetupM5(w http.ResponseWriter, tlvs map[byte][]byte) {
 	// M6 response: exchange complete
 	globalPairSession.mu.Lock()
+	srpK := globalPairSession.srpK
 	globalPairSession.setupStep = 6
 	globalPairSession.paired = true
 	globalPairSession.mu.Unlock()
@@ -187,12 +205,11 @@ func (s *Server) handlePairSetupM5(w http.ResponseWriter, tlvs map[byte][]byte) 
 	s.PairState.Paired = true
 	s.PairState.mu.Unlock()
 
-	// Derive encryption keys using HKDF
-	encKey := deriveKey(globalPairSession.sharedSecret, "Pair-Setup-Encrypt-Salt", "Pair-Setup-Encrypt-Info")
+	encData := buildPairSetupM6(srpK, s.Config.DeviceID, globalPairSession.serverPrivKey, globalPairSession.serverPubKey)
 
 	resp := tlvEncode(map[byte][]byte{
 		TLVState:   {0x06},
-		TLVEncData: encKey[:32],
+		TLVEncData: encData,
 	})
 
 	s.EmitEvent("pairing", map[string]interface{}{
@@ -251,20 +268,29 @@ func (s *Server) handlePairVerifyM1(w http.ResponseWriter, tlvs map[byte][]byte)
 	}
 	globalPairSession.mu.Unlock()
 
-	// Sign our public key + peer public key
-	material := append(globalPairSession.curvePub[:], clientPub...)
-	sig := ed25519.Sign(globalPairSession.serverPrivKey, material)
+	// Derive verify key
+	verifyKey := deriveKey(shared[:], "Pair-Verify-Encrypt-Salt", "Pair-Verify-Encrypt-Info")
 
-	// Build sub-TLV with identifier + signature
-	subTLV := tlvEncode(map[byte][]byte{
+	// Sign our curve public key + client's curve public key
+	sigMaterial := append(globalPairSession.curvePub[:], clientPub...)
+	sig := ed25519.Sign(globalPairSession.serverPrivKey, sigMaterial)
+
+	// Build inner TLV
+	inner := tlvEncode(map[byte][]byte{
 		TLVIdentifier: []byte(s.Config.DeviceID),
 		TLVSignature:  sig,
 	})
 
+	// Encrypt inner TLV with ChaCha20-Poly1305
+	nonce := [12]byte{}
+	copy(nonce[4:], "PV-Msg02")
+	aead, _ := chacha20poly1305.New(verifyKey)
+	encData := aead.Seal(nil, nonce[:], inner, nil)
+
 	resp := tlvEncode(map[byte][]byte{
 		TLVState:     {0x02},
 		TLVPublicKey: globalPairSession.curvePub[:],
-		TLVEncData:   subTLV,
+		TLVEncData:   encData,
 	})
 
 	s.EmitEvent("pairing", map[string]interface{}{

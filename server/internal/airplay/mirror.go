@@ -95,6 +95,15 @@ func (s *Server) handleMirrorPOST(conn net.Conn, req string, httpBuf []byte) {
 	s.EmitEvent("mirror_stop", nil)
 }
 
+func isH264Keyframe(data []byte) bool {
+	// avcC format: 4-byte big-endian length prefix then NAL header
+	if len(data) < 5 {
+		return false
+	}
+	nalType := data[4] & 0x1f
+	return nalType == 5 // IDR slice
+}
+
 func (s *Server) readMirrorStream(conn net.Conn) {
 	header := make([]byte, MirrorHeaderSize)
 
@@ -124,27 +133,37 @@ func (s *Server) readMirrorStream(conn net.Conn) {
 			if pkt.PayloadSize > 0 {
 				payload := make([]byte, pkt.PayloadSize)
 				if _, err := io.ReadFull(conn, payload); err != nil {
-					log.Printf("Mirror codec data read error: %v", err)
 					return
 				}
-				s.EmitEvent("mirror_codec", map[string]interface{}{
-					"size": pkt.PayloadSize,
-				})
 				log.Printf("Mirror codec data: %d bytes", pkt.PayloadSize)
+				// Forward to browser: [0x01][avcC data]
+				msg := make([]byte, 1+len(payload))
+				msg[0] = 0x01
+				copy(msg[1:], payload)
+				s.broadcastBinary(msg)
 			}
 
 		case PacketTypeVideo:
 			if pkt.PayloadSize > 0 && pkt.PayloadSize < 10*1024*1024 {
 				payload := make([]byte, pkt.PayloadSize)
 				if _, err := io.ReadFull(conn, payload); err != nil {
-					log.Printf("Mirror video read error: %v", err)
 					return
 				}
-				// Send to channel for frontend consumption
+				// Forward to browser: [0x02][8-byte NTP big-endian][1-byte keyframe][H.264 data]
+				keyframe := byte(0)
+				if isH264Keyframe(payload) {
+					keyframe = 1
+				}
+				msg := make([]byte, 10+len(payload))
+				msg[0] = 0x02
+				binary.BigEndian.PutUint64(msg[1:9], pkt.NTPTimestamp)
+				msg[9] = keyframe
+				copy(msg[10:], payload)
+				s.broadcastBinary(msg)
+				// Also send to channel
 				select {
 				case s.MirrorCh <- payload:
 				default:
-					// Drop frame if channel full
 				}
 			}
 
