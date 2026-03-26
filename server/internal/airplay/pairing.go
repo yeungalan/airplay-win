@@ -296,6 +296,16 @@ func (s *Server) handlePairVerifyM3(w http.ResponseWriter, tlvs map[byte][]byte)
 	w.Write(resp)
 }
 
+func (s *Server) handlePairPinStart(w http.ResponseWriter, r *http.Request) {
+	log.Printf("POST /pair-pin-start from %s (PIN: %s)", r.RemoteAddr, s.Config.PIN)
+	s.EmitEvent("pairing", map[string]interface{}{
+		"step":    "pin-start",
+		"message": "PIN pairing initiated - PIN: " + s.Config.PIN,
+	})
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
+}
+
 func (s *Server) handleFPSetup(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	log.Printf("POST /fp-setup (%d bytes) from %s", len(body), r.RemoteAddr)

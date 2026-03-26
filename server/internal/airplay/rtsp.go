@@ -62,6 +62,15 @@ func (s *Server) handleRTSPConnection(conn net.Conn) {
 </plist>`, s.Config.DeviceID, s.Config.Features, s.Config.Model, s.Config.Name, s.Config.SrcVersion, s.Config.StatusFlags)
 			respHeaders = map[string]string{"Content-Type": "text/x-apple-plist+xml"}
 
+		case req.Method == "POST" && strings.HasSuffix(req.URI, "/pair-pin-start"):
+			log.Printf("RTSP pair-pin-start from %s (PIN: %s)", conn.RemoteAddr(), s.Config.PIN)
+			s.EmitEvent("pairing", map[string]interface{}{
+				"step":    "pin-start",
+				"message": "PIN pairing initiated - PIN: " + s.Config.PIN,
+			})
+			writeRTSPResponse(conn, "200 OK", req.CSeq, nil, "")
+			continue
+
 		case req.Method == "POST" && strings.HasSuffix(req.URI, "/pair-setup"):
 			// Forward to pairing handler
 			s.handleRTSPPairSetup(conn, req)
