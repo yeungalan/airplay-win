@@ -245,21 +245,29 @@ func (s *Server) handleRTSPPairVerify(conn net.Conn, req *RTSPRequest) {
 	case 1:
 		clientPub := tlvs[TLVPublicKey]
 
+		// Generate fresh ephemeral Curve25519 keypair for this verify session
+		var ephPriv, ephPub [32]byte
+		rand.Read(ephPriv[:])
+		curve25519.ScalarBaseMult(&ephPub, &ephPriv)
+
 		globalPairSession.mu.Lock()
 		globalPairSession.peerPub = clientPub
 		globalPairSession.verifyStep = 2
+		globalPairSession.curvePriv = ephPriv
+		globalPairSession.curvePub = ephPub
 
 		var shared [32]byte
 		if len(clientPub) == 32 {
 			var peerPub [32]byte
 			copy(peerPub[:], clientPub)
-			curve25519.ScalarMult(&shared, &globalPairSession.curvePriv, &peerPub)
+			curve25519.ScalarMult(&shared, &ephPriv, &peerPub)
 			globalPairSession.sharedSecret = shared[:]
 		}
 		globalPairSession.mu.Unlock()
 
 		verifyKey := deriveKey(shared[:], "Pair-Verify-Encrypt-Salt", "Pair-Verify-Encrypt-Info")
-		sigMaterial := append(globalPairSession.curvePub[:], clientPub...)
+		// Signature covers: server ephemeral pub || server pairing ID || client ephemeral pub
+		sigMaterial := append(append(ephPub[:], []byte(s.Config.DeviceID)...), clientPub...)
 		sig := ed25519.Sign(globalPairSession.serverPrivKey, sigMaterial)
 		inner := tlvEncode(map[byte][]byte{
 			TLVIdentifier: []byte(s.Config.DeviceID),
@@ -271,7 +279,7 @@ func (s *Server) handleRTSPPairVerify(conn net.Conn, req *RTSPRequest) {
 		encData := aead.Seal(nil, nonce[:], inner, nil)
 		resp = tlvEncode(map[byte][]byte{
 			TLVState:     {0x02},
-			TLVPublicKey: globalPairSession.curvePub[:],
+			TLVPublicKey: ephPub[:],
 			TLVEncData:   encData,
 		})
 	case 3:
@@ -354,8 +362,15 @@ func readRTSPRequest(reader *bufio.Reader) (*RTSPRequest, error) {
 		}
 	}
 
-	// Read body if Content-Length present
-	if clStr, ok := req.Headers["Content-Length"]; ok {
+	// Read body if Content-Length present (case-insensitive lookup per RTSP RFC)
+	var clStr string
+	for k, v := range req.Headers {
+		if strings.EqualFold(k, "content-length") {
+			clStr = v
+			break
+		}
+	}
+	if clStr != "" {
 		cl, _ := strconv.Atoi(clStr)
 		if cl > 0 {
 			req.Body = make([]byte, cl)

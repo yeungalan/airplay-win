@@ -281,16 +281,23 @@ func (s *Server) handlePairVerify(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePairVerifyM1(w http.ResponseWriter, tlvs map[byte][]byte) {
 	clientPub := tlvs[TLVPublicKey]
 
+	// Generate fresh ephemeral Curve25519 keypair for this verify session
+	var ephPriv, ephPub [32]byte
+	rand.Read(ephPriv[:])
+	curve25519.ScalarBaseMult(&ephPub, &ephPriv)
+
 	globalPairSession.mu.Lock()
 	globalPairSession.peerPub = clientPub
 	globalPairSession.verifyStep = 2
+	globalPairSession.curvePriv = ephPriv
+	globalPairSession.curvePub = ephPub
 
 	// Compute shared secret via Curve25519
 	var shared [32]byte
 	if len(clientPub) == 32 {
 		var peerPub [32]byte
 		copy(peerPub[:], clientPub)
-		curve25519.ScalarMult(&shared, &globalPairSession.curvePriv, &peerPub)
+		curve25519.ScalarMult(&shared, &ephPriv, &peerPub)
 		globalPairSession.sharedSecret = shared[:]
 	}
 	globalPairSession.mu.Unlock()
@@ -298,8 +305,8 @@ func (s *Server) handlePairVerifyM1(w http.ResponseWriter, tlvs map[byte][]byte)
 	// Derive verify key
 	verifyKey := deriveKey(shared[:], "Pair-Verify-Encrypt-Salt", "Pair-Verify-Encrypt-Info")
 
-	// Sign our curve public key + client's curve public key
-	sigMaterial := append(globalPairSession.curvePub[:], clientPub...)
+	// Signature covers: server ephemeral pub || server pairing ID || client ephemeral pub
+	sigMaterial := append(append(ephPub[:], []byte(s.Config.DeviceID)...), clientPub...)
 	sig := ed25519.Sign(globalPairSession.serverPrivKey, sigMaterial)
 
 	// Build inner TLV
@@ -316,7 +323,7 @@ func (s *Server) handlePairVerifyM1(w http.ResponseWriter, tlvs map[byte][]byte)
 
 	resp := tlvEncode(map[byte][]byte{
 		TLVState:     {0x02},
-		TLVPublicKey: globalPairSession.curvePub[:],
+		TLVPublicKey: ephPub[:],
 		TLVEncData:   encData,
 	})
 
