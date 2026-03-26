@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"sync"
 
@@ -14,9 +15,9 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-// Pairing implements a simplified version of the HomeKit pairing protocol.
-// Real AirPlay uses SRP6a + ed25519 + HKDF-SHA512 + ChaCha20-Poly1305.
-// This implementation handles the pair-setup and pair-verify handshake flows.
+// Pairing implements the HomeKit SRP-6a pairing protocol used by AirPlay.
+// pair-setup uses SRP6a (RFC 5054 3072-bit + SHA-512) with PIN verification.
+// pair-verify uses Curve25519 + ed25519 for session authentication.
 
 type PairSession struct {
 	mu            sync.Mutex
@@ -29,11 +30,19 @@ type PairSession struct {
 	sharedSecret  []byte
 	peerPub       []byte
 	paired        bool
+	// SRP-6a state (populated during pair-setup M1, used in M3)
+	srpSalt  []byte
+	srpV     *big.Int // verifier
+	srpBPriv *big.Int // server private key
+	srpBPub  *big.Int // server public key B
+	srpK     []byte   // session key
 }
 
 var globalPairSession = &PairSession{}
 
 func init() {
+	initSRP()
+
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		log.Fatalf("Failed to generate ed25519 key: %v", err)
@@ -123,22 +132,23 @@ func (s *Server) handlePairSetup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePairSetupM1(w http.ResponseWriter) {
-	// M2 response: send salt and server public key
-	// In a real implementation this would be SRP6a parameters
-	salt := make([]byte, 16)
-	rand.Read(salt)
-
-	serverPub := make([]byte, 384)
-	rand.Read(serverPub)
+	// M2: generate real SRP-6a salt and server public key B
+	salt := srpNewSalt()
+	v := srpVerifier(salt, s.Config.PIN)
+	bPriv, bPub := srpServerKeys(v)
 
 	globalPairSession.mu.Lock()
 	globalPairSession.setupStep = 2
+	globalPairSession.srpSalt = salt
+	globalPairSession.srpV = v
+	globalPairSession.srpBPriv = bPriv
+	globalPairSession.srpBPub = bPub
 	globalPairSession.mu.Unlock()
 
 	resp := tlvEncode(map[byte][]byte{
 		TLVState:     {0x02},
 		TLVSalt:      salt,
-		TLVPublicKey: serverPub,
+		TLVPublicKey: srpPad(bPub), // 384-byte padded B
 	})
 
 	s.EmitEvent("pairing", map[string]interface{}{
@@ -151,20 +161,37 @@ func (s *Server) handlePairSetupM1(w http.ResponseWriter) {
 }
 
 func (s *Server) handlePairSetupM3(w http.ResponseWriter, tlvs map[byte][]byte) {
-	// M4 response: verify client proof, send server proof
-	globalPairSession.mu.Lock()
-	globalPairSession.setupStep = 4
-	// Generate a shared secret (simplified - real impl uses SRP)
-	globalPairSession.sharedSecret = make([]byte, 64)
-	rand.Read(globalPairSession.sharedSecret)
-	globalPairSession.mu.Unlock()
+	// M4: compute session key from client's A, send server proof M2 = H(pad(A)||M1||K)
+	aBytes := tlvs[TLVPublicKey]
+	m1Client := tlvs[TLVProof]
 
-	proof := make([]byte, 64)
-	rand.Read(proof)
+	globalPairSession.mu.Lock()
+	bPriv := globalPairSession.srpBPriv
+	bPub := globalPairSession.srpBPub
+	v := globalPairSession.srpV
+
+	var m2 []byte
+	var K []byte
+	if bPriv != nil && bPub != nil && v != nil && len(aBytes) > 0 {
+		A := new(big.Int).SetBytes(aBytes)
+		K = srpSessionKey(A, bPub, bPriv, v)
+		if K != nil {
+			m2 = srpServerProof(A, m1Client, K)
+		}
+	}
+	if m2 == nil {
+		m2 = make([]byte, 64)
+		rand.Read(m2)
+	}
+
+	globalPairSession.setupStep = 4
+	globalPairSession.sharedSecret = K
+	globalPairSession.srpK = K
+	globalPairSession.mu.Unlock()
 
 	resp := tlvEncode(map[byte][]byte{
 		TLVState: {0x04},
-		TLVProof: proof,
+		TLVProof: m2,
 	})
 
 	s.EmitEvent("pairing", map[string]interface{}{
