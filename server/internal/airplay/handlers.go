@@ -27,6 +27,7 @@ func (s *Server) buildAirPlayMux() *http.ServeMux {
 	mux.HandleFunc("/playback-info", s.handlePlaybackInfo)
 	mux.HandleFunc("/setProperty", s.handleSetProperty)
 	mux.HandleFunc("/getProperty", s.handleGetProperty)
+	mux.HandleFunc("/pair-pin-start", s.handlePairPinStart)
 	mux.HandleFunc("/pair-setup", s.handlePairSetup)
 	mux.HandleFunc("/pair-verify", s.handlePairVerify)
 	mux.HandleFunc("/fp-setup", s.handleFPSetup)
