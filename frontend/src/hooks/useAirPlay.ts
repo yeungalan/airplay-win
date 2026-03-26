@@ -25,6 +25,7 @@ export function useAirPlay() {
 
     setConnectionState("connecting");
     const ws = new WebSocket(getWsUrl());
+    ws.binaryType = 'arraybuffer';
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -33,6 +34,10 @@ export function useAirPlay() {
     };
 
     ws.onmessage = (e) => {
+      if (e.data instanceof ArrayBuffer) {
+        window.dispatchEvent(new CustomEvent('mirrorData', { detail: e.data }));
+        return;
+      }
       try {
         const msg: AirPlayEvent = JSON.parse(e.data);
         if (msg.type === "status") {

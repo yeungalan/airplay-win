@@ -10,9 +10,14 @@ import (
 	"golang.org/x/net/websocket"
 )
 
+type wsMsg struct {
+	isBinary bool
+	data     []byte
+}
+
 type wsClient struct {
 	conn *websocket.Conn
-	send chan []byte
+	send chan wsMsg
 }
 
 var (
@@ -24,7 +29,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	wsHandler := websocket.Handler(func(ws *websocket.Conn) {
 		client := &wsClient{
 			conn: ws,
-			send: make(chan []byte, 64),
+			send: make(chan wsMsg, 64),
 		}
 
 		wsClientsMu.Lock()
@@ -41,8 +46,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			defer close(done)
 			for msg := range client.send {
-				if _, err := ws.Write(msg); err != nil {
-					return
+				if msg.isBinary {
+					websocket.Message.Send(ws, msg.data)
+				} else {
+					websocket.Message.Send(ws, string(msg.data))
 				}
 			}
 		}()
@@ -85,8 +92,21 @@ func (s *Server) broadcastWS(data []byte) {
 	wsClientsMu.RLock()
 	defer wsClientsMu.RUnlock()
 	for client := range wsClients {
+		msg := wsMsg{isBinary: false, data: data}
 		select {
-		case client.send <- data:
+		case client.send <- msg:
+		default:
+		}
+	}
+}
+
+func (s *Server) broadcastBinary(data []byte) {
+	wsClientsMu.RLock()
+	defer wsClientsMu.RUnlock()
+	for client := range wsClients {
+		msg := wsMsg{isBinary: true, data: data}
+		select {
+		case client.send <- msg:
 		default:
 		}
 	}
@@ -116,7 +136,7 @@ func (s *Server) sendStatus(client *wsClient) {
 
 	data, _ := json.Marshal(status)
 	select {
-	case client.send <- data:
+	case client.send <- wsMsg{isBinary: false, data: data}:
 	default:
 	}
 }

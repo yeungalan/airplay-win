@@ -2,6 +2,7 @@ package airplay
 
 import (
 	"bufio"
+	"crypto/ed25519"
 	"crypto/rand"
 	"fmt"
 	"io"
@@ -10,6 +11,9 @@ import (
 	"net"
 	"strconv"
 	"strings"
+
+	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/curve25519"
 )
 
 // RTSP request parsed from raw TCP
@@ -98,7 +102,7 @@ func (s *Server) handleRTSPConnection(conn net.Conn) {
 			respHeaders = map[string]string{
 				"Transport": fmt.Sprintf("RTP/AVP/UDP;unicast;mode=record;server_port=%d;control_port=%d;timing_port=%d",
 					s.Config.AirTunesPort+1, s.Config.AirTunesPort+2, s.Config.AirTunesPort+3),
-				"Session": "1",
+				"Session":           "1",
 				"Audio-Jack-Status": "connected; type=analog",
 			}
 
@@ -205,24 +209,17 @@ func (s *Server) handleRTSPPairSetup(conn net.Conn, req *RTSPRequest) {
 
 	case 5:
 		globalPairSession.mu.Lock()
+		srpK := globalPairSession.srpK
 		globalPairSession.setupStep = 6
 		globalPairSession.paired = true
 		globalPairSession.mu.Unlock()
-
 		s.PairState.mu.Lock()
 		s.PairState.Paired = true
 		s.PairState.mu.Unlock()
-
 		log.Printf("RTSP pairing complete!")
-		s.EmitEvent("pairing", map[string]interface{}{
-			"step":    "M5-M6",
-			"message": "Pairing complete!",
-			"paired":  true,
-		})
-
-		resp = tlvEncode(map[byte][]byte{
-			TLVState: {0x06},
-		})
+		s.EmitEvent("pairing", map[string]interface{}{"step": "M5-M6", "message": "Pairing complete!", "paired": true})
+		encData := buildPairSetupM6(srpK, s.Config.DeviceID, globalPairSession.serverPrivKey, globalPairSession.serverPubKey)
+		resp = tlvEncode(map[byte][]byte{TLVState: {0x06}, TLVEncData: encData})
 	default:
 		resp = tlvEncode(map[byte][]byte{
 			TLVState: {state + 1},
@@ -246,10 +243,36 @@ func (s *Server) handleRTSPPairVerify(conn net.Conn, req *RTSPRequest) {
 	var resp []byte
 	switch state {
 	case 1:
+		clientPub := tlvs[TLVPublicKey]
+
+		globalPairSession.mu.Lock()
+		globalPairSession.peerPub = clientPub
+		globalPairSession.verifyStep = 2
+
+		var shared [32]byte
+		if len(clientPub) == 32 {
+			var peerPub [32]byte
+			copy(peerPub[:], clientPub)
+			curve25519.ScalarMult(&shared, &globalPairSession.curvePriv, &peerPub)
+			globalPairSession.sharedSecret = shared[:]
+		}
+		globalPairSession.mu.Unlock()
+
+		verifyKey := deriveKey(shared[:], "Pair-Verify-Encrypt-Salt", "Pair-Verify-Encrypt-Info")
+		sigMaterial := append(globalPairSession.curvePub[:], clientPub...)
+		sig := ed25519.Sign(globalPairSession.serverPrivKey, sigMaterial)
+		inner := tlvEncode(map[byte][]byte{
+			TLVIdentifier: []byte(s.Config.DeviceID),
+			TLVSignature:  sig,
+		})
+		nonce := [12]byte{}
+		copy(nonce[4:], "PV-Msg02")
+		aead, _ := chacha20poly1305.New(verifyKey)
+		encData := aead.Seal(nil, nonce[:], inner, nil)
 		resp = tlvEncode(map[byte][]byte{
 			TLVState:     {0x02},
 			TLVPublicKey: globalPairSession.curvePub[:],
-			TLVEncData:   []byte("verified"),
+			TLVEncData:   encData,
 		})
 	case 3:
 		resp = tlvEncode(map[byte][]byte{
