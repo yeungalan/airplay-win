@@ -1,6 +1,8 @@
 package airplay
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha512"
@@ -120,6 +122,24 @@ func (s *Server) handlePairSetup(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	// Transient pair-setup: raw 32-byte Ed25519 public key (no TLV)
+	if len(body) == 32 {
+		log.Printf("POST /pair-setup transient: 32-byte Ed25519 key from %s", r.RemoteAddr)
+		globalPairSession.mu.Lock()
+		globalPairSession.peerPub = body
+		globalPairSession.paired = true
+		globalPairSession.mu.Unlock()
+		s.PairState.mu.Lock()
+		s.PairState.Paired = true
+		s.PairState.mu.Unlock()
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(globalPairSession.serverPubKey)
+		s.EmitEvent("pairing", map[string]interface{}{
+			"step": "transient-setup", "message": "Transient pairing complete", "paired": true,
+		})
 		return
 	}
 
@@ -391,4 +411,24 @@ func deriveKey(secret []byte, salt, info string) []byte {
 // GetPublicKeyHex returns the server's ed25519 public key as hex string for mDNS TXT record
 func GetPublicKeyHex() string {
 	return hex.EncodeToString(globalPairSession.serverPubKey)
+}
+
+// deriveKeyLegacy derives a 16-byte key using SHA-512 of (info || secret).
+// Used for legacy pair-verify AES-CTR-128 key/iv derivation per UxPlay crypto spec.
+func deriveKeyLegacy(secret []byte, info string) []byte {
+	h := sha512.New()
+	h.Write([]byte(info))
+	h.Write(secret)
+	return h.Sum(nil)[:16]
+}
+
+// aesCTR128 encrypts/decrypts data using AES-128-CTR.
+func aesCTR128(key, iv, data []byte) []byte {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return data
+	}
+	out := make([]byte, len(data))
+	cipher.NewCTR(block, iv).XORKeyStream(out, data)
+	return out
 }

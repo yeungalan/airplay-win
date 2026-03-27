@@ -128,10 +128,21 @@ func (s *Server) handleRTSPConnection(conn net.Conn) {
 		switch {
 		case req.Method == "OPTIONS":
 			respHeaders = map[string]string{
-				"Public": "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, FLUSHBUFFERED, TEARDOWN, OPTIONS, POST, GET, SET_PARAMETER",
+				"Public": "ANNOUNCE, SETUP, RECORD, PAUSE, FLUSH, FLUSHBUFFERED, TEARDOWN, OPTIONS, POST, GET, SET_PARAMETER, GET_PARAMETER, SETPEERS",
 			}
 
 		case req.Method == "GET" && strings.HasSuffix(req.URI, "/info"):
+			// AirPlay 2: respond with binary plist if client sends bplist body
+			ct := req.Headers["Content-Type"]
+			if ct == "application/x-apple-binary-plist" || (len(req.Body) > 8 && string(req.Body[:8]) == "bplist00") {
+				info := s.buildInfoDict()
+				data, err := BPlistEncode(info)
+				if err == nil {
+					respBody = string(data)
+					respHeaders = map[string]string{"Content-Type": "application/x-apple-binary-plist"}
+					break
+				}
+			}
 			respBody = fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -156,15 +167,46 @@ func (s *Server) handleRTSPConnection(conn net.Conn) {
 			continue
 
 		case req.Method == "POST" && strings.HasSuffix(req.URI, "/pair-setup"):
-			// Forward to pairing handler
+			// Detect transient (no-pin) pair-setup: raw 32-byte Ed25519 public key, no TLV
+			if len(req.Body) == 32 {
+				log.Printf("RTSP transient pair-setup: received 32-byte client Ed25519 public key")
+				globalPairSession.mu.Lock()
+				globalPairSession.peerPub = req.Body
+				globalPairSession.paired = true
+				globalPairSession.mu.Unlock()
+				s.PairState.mu.Lock()
+				s.PairState.Paired = true
+				s.PairState.mu.Unlock()
+				// Respond with our 32-byte Ed25519 public key
+				writeRTSPResponse(conn, "200 OK", req.CSeq, map[string]string{
+					"Content-Type": "application/octet-stream",
+				}, string(globalPairSession.serverPubKey))
+				s.EmitEvent("pairing", map[string]interface{}{
+					"step": "transient-setup", "message": "Transient pairing complete", "paired": true,
+				})
+				continue
+			}
+			// Forward to TLV-based pairing handler (HomeKit SRP)
+			s.handleRTSPPairSetup(conn, req)
+			continue
+
+		case req.Method == "POST" && strings.HasSuffix(req.URI, "/pair-setup-pin"):
+			// PIN-based pair-setup uses same TLV handler
 			s.handleRTSPPairSetup(conn, req)
 			continue
 
 		case req.Method == "POST" && strings.HasSuffix(req.URI, "/pair-verify"):
+			// Detect legacy pair-verify: 68 bytes = {4-byte header}|{32-byte ECDH pub}|{32-byte Ed25519 pub}
+			if len(req.Body) == 68 && req.Body[0] == 1 && req.Body[1] == 0 && req.Body[2] == 0 && req.Body[3] == 0 {
+				s.handleRTSPLegacyPairVerifyM1(conn, req)
+				continue
+			}
+			if len(req.Body) == 68 && req.Body[0] == 0 && req.Body[1] == 0 && req.Body[2] == 0 && req.Body[3] == 0 {
+				s.handleRTSPLegacyPairVerifyM3(conn, req)
+				continue
+			}
+			// TLV-based pair-verify (HomeKit)
 			if s.handleRTSPPairVerify(conn, req) {
-				// Pair-verify M4 just sent — upgrade connection to session encryption.
-				// Controller→Accessory uses "Control-Write-Encryption-Key" (our read key).
-				// Accessory→Controller uses "Control-Read-Encryption-Key" (our write key).
 				globalPairSession.mu.Lock()
 				sharedSecret := make([]byte, len(globalPairSession.sharedSecret))
 				copy(sharedSecret, globalPairSession.sharedSecret)
@@ -185,7 +227,13 @@ func (s *Server) handleRTSPConnection(conn net.Conn) {
 			log.Printf("RTSP ANNOUNCE: audio session announced")
 
 		case req.Method == "SETUP":
-			// Parse transport header for audio setup
+			// AirPlay 2: SETUP with binary plist body
+			ct := req.Headers["Content-Type"]
+			if ct == "application/x-apple-binary-plist" || (len(req.Body) > 8 && string(req.Body[:8]) == "bplist00") {
+				s.handleRTSPSetupBPlist(writer, req)
+				continue
+			}
+			// AirPlay 1: Parse transport header for audio setup
 			transport := req.Headers["Transport"]
 			log.Printf("RTSP SETUP transport: %s", transport)
 			s.EmitEvent("audio_setup", map[string]interface{}{
@@ -209,9 +257,57 @@ func (s *Server) handleRTSPConnection(conn net.Conn) {
 			log.Printf("RTSP FLUSH")
 			s.EmitEvent("audio_flush", nil)
 
+		case req.Method == "FLUSHBUFFERED":
+			log.Printf("RTSP FLUSHBUFFERED")
+			// AirPlay 2: flush buffered audio with optional sequence/timestamp
+			if len(req.Body) > 0 {
+				parsed, _ := BPlistDecode(req.Body)
+				if m, ok := parsed.(map[string]interface{}); ok {
+					log.Printf("FLUSHBUFFERED params: %v", m)
+				}
+			}
+			s.EmitEvent("audio_flush", map[string]interface{}{"buffered": true})
+
+		case req.Method == "SETPEERS":
+			log.Printf("RTSP SETPEERS")
+			// AirPlay 2: PTP peer list (binary plist with addresses)
+			if len(req.Body) > 0 {
+				parsed, _ := BPlistDecode(req.Body)
+				if arr, ok := parsed.([]interface{}); ok {
+					log.Printf("SETPEERS: %d peers", len(arr))
+				}
+			}
+
 		case req.Method == "TEARDOWN":
-			log.Printf("RTSP TEARDOWN: audio session ended")
+			log.Printf("RTSP TEARDOWN from %s", conn.RemoteAddr())
+			// AirPlay 2: body may contain streams to tear down (partial) or empty dict (full disconnect)
+			if len(req.Body) > 0 {
+				parsed, _ := BPlistDecode(req.Body)
+				if m, ok := parsed.(map[string]interface{}); ok {
+					if streams, ok := m["streams"].([]interface{}); ok && len(streams) > 0 {
+						log.Printf("TEARDOWN: partial - %d streams", len(streams))
+						s.EmitEvent("audio_stop", map[string]interface{}{"partial": true})
+						break
+					}
+				}
+			}
+			log.Printf("TEARDOWN: full disconnect")
 			s.EmitEvent("audio_stop", nil)
+
+		case req.Method == "GET_PARAMETER":
+			// AirPlay 1/2: return requested parameter
+			ct := req.Headers["Content-Type"]
+			if ct == "text/parameters" {
+				param := strings.TrimSpace(string(req.Body))
+				log.Printf("RTSP GET_PARAMETER: %s", param)
+				switch param {
+				case "volume":
+					respBody = "volume: -20.000000\n"
+					respHeaders = map[string]string{"Content-Type": "text/parameters"}
+				default:
+					respBody = ""
+				}
+			}
 
 		case req.Method == "POST" && strings.HasSuffix(req.URI, "/feedback"):
 			// Feedback - just acknowledge
@@ -397,6 +493,80 @@ func (s *Server) handleRTSPPairVerify(conn net.Conn, req *RTSPRequest) bool {
 	return false
 }
 
+// handleRTSPLegacyPairVerifyM1 handles legacy pair-verify M1:
+// 68 bytes = {1,0,0,0} | ECDH_PK(client, 32) | Ed25519_PK(client, 32)
+// Per UxPlay crypto wiki: server generates ECDH keypair, derives shared secret,
+// signs ECDH_PK(server)||ECDH_PK(client) with Ed25519, encrypts with AES-CTR-128,
+// responds with 96 bytes = ECDH_PK(server, 32) | encrypted_signature(64)
+func (s *Server) handleRTSPLegacyPairVerifyM1(conn net.Conn, req *RTSPRequest) {
+	clientECDH := req.Body[4:36]
+	clientEd := req.Body[36:68]
+
+	log.Printf("RTSP legacy pair-verify M1: ECDH=%x... Ed25519=%x...", clientECDH[:4], clientEd[:4])
+
+	// Generate ephemeral ECDH keypair
+	var ephPriv, ephPub [32]byte
+	rand.Read(ephPriv[:])
+	curve25519.ScalarBaseMult(&ephPub, &ephPriv)
+
+	// Compute shared secret
+	var shared [32]byte
+	var peerECDH [32]byte
+	copy(peerECDH[:], clientECDH)
+	curve25519.ScalarMult(&shared, &ephPriv, &peerECDH)
+
+	// Derive AES key and IV for AES-CTR-128
+	aesKey := deriveKeyLegacy(shared[:], "Pair-Verify-AES-Key")
+	aesIV := deriveKeyLegacy(shared[:], "Pair-Verify-AES-IV")
+
+	// Store for M3
+	globalPairSession.mu.Lock()
+	globalPairSession.peerPub = clientEd
+	globalPairSession.curvePriv = ephPriv
+	globalPairSession.curvePub = ephPub
+	globalPairSession.sharedSecret = shared[:]
+	globalPairSession.verifyStep = 2
+	globalPairSession.mu.Unlock()
+
+	// Sign: ECDH_PK(server) || ECDH_PK(client)
+	sigMaterial := append(ephPub[:], clientECDH...)
+	sig := ed25519.Sign(globalPairSession.serverPrivKey, sigMaterial)
+
+	// Encrypt signature with AES-CTR-128
+	encSig := aesCTR128(aesKey[:16], aesIV[:16], sig)
+
+	// Response: ECDH_PK(server, 32) || encrypted_signature(64)
+	resp := make([]byte, 96)
+	copy(resp[:32], ephPub[:])
+	copy(resp[32:], encSig)
+
+	writeRTSPResponse(conn, "200 OK", req.CSeq, map[string]string{
+		"Content-Type": "application/octet-stream",
+	}, string(resp))
+}
+
+// handleRTSPLegacyPairVerifyM3 handles legacy pair-verify M3:
+// 68 bytes = {0,0,0,0} | encrypted_signature(64)
+func (s *Server) handleRTSPLegacyPairVerifyM3(conn net.Conn, req *RTSPRequest) {
+	log.Printf("RTSP legacy pair-verify M3")
+
+	globalPairSession.mu.Lock()
+	globalPairSession.verifyStep = 4
+	globalPairSession.paired = true
+	globalPairSession.mu.Unlock()
+
+	s.PairState.mu.Lock()
+	s.PairState.Paired = true
+	s.PairState.mu.Unlock()
+
+	s.EmitEvent("pairing", map[string]interface{}{
+		"step": "legacy-verify-complete", "message": "Legacy pair verified!", "verified": true,
+	})
+
+	writeRTSPResponse(conn, "200 OK", req.CSeq, map[string]string{
+		"Content-Type": "application/octet-stream",
+	}, "")
+}
 func (s *Server) handleRTSPSetParameter(req *RTSPRequest) {
 	ct := req.Headers["Content-Type"]
 	switch ct {
@@ -407,13 +577,27 @@ func (s *Server) handleRTSPSetParameter(req *RTSPRequest) {
 			s.EmitEvent("volume", map[string]interface{}{"volume": v})
 			log.Printf("Volume: %.1f", v)
 		}
+		if prog, ok := params["progress"]; ok {
+			// Format: "start/current/end" in sample time (44100 Hz)
+			parts := strings.Split(strings.TrimSpace(prog), "/")
+			if len(parts) == 3 {
+				s.EmitEvent("progress", map[string]interface{}{"progress": prog})
+				log.Printf("Progress: %s", prog)
+			}
+		}
+	case "application/x-dmap-tagged":
+		// DAAP now-playing metadata
+		s.EmitEvent("audio_metadata", map[string]interface{}{
+			"contentType": ct,
+			"size":        len(req.Body),
+		})
+		log.Printf("DMAP metadata: %d bytes", len(req.Body))
 	case "image/jpeg", "image/png":
 		s.EmitEvent("audio_artwork", map[string]interface{}{
 			"size":        len(req.Body),
 			"contentType": ct,
 		})
 	default:
-		// Could be DMAP metadata
 		s.EmitEvent("audio_metadata", map[string]interface{}{
 			"contentType": ct,
 			"size":        len(req.Body),
@@ -489,6 +673,7 @@ func writeRTSPResponse(w io.Writer, status, cseq string, headers map[string]stri
 	if cseq != "" {
 		resp += fmt.Sprintf("CSeq: %s\r\n", cseq)
 	}
+	resp += "Server: AirTunes/380.20.1\r\n"
 	resp += fmt.Sprintf("Content-Length: %d\r\n", len(body))
 	for k, v := range headers {
 		resp += fmt.Sprintf("%s: %s\r\n", k, v)
@@ -496,4 +681,179 @@ func writeRTSPResponse(w io.Writer, status, cseq string, headers map[string]stri
 	resp += "\r\n"
 	resp += body
 	w.Write([]byte(resp))
+}
+
+// buildInfoDict returns the /info response as a map for binary plist encoding.
+func (s *Server) buildInfoDict() map[string]interface{} {
+	return map[string]interface{}{
+		"deviceid":     s.Config.DeviceID,
+		"features":     int64(s.Config.Features),
+		"model":        s.Config.Model,
+		"protovers":    "1.1",
+		"srcvers":      s.Config.SrcVersion,
+		"name":         s.Config.Name,
+		"statusFlags":  int64(s.Config.StatusFlags),
+		"pi":           "b08f5a79-db29-4384-b456-a4784d9e6055",
+		"pk":           GetPublicKeyHex(),
+		"vv":           int64(2),
+		"initialVolume": float64(-20.0),
+		"audioFormats": []interface{}{
+			map[string]interface{}{
+				"type":               int64(96),
+				"audioInputFormats":  int64(0x01000000),
+				"audioOutputFormats": int64(0x01000000),
+			},
+			map[string]interface{}{
+				"type":               int64(103),
+				"audioInputFormats":  int64(0x04000000),
+				"audioOutputFormats": int64(0x04000000),
+			},
+		},
+		"audioLatencies": []interface{}{
+			map[string]interface{}{
+				"type":                int64(96),
+				"audioType":           "default",
+				"inputLatencyMicros":  int64(0),
+				"outputLatencyMicros": int64(400000),
+			},
+		},
+		"displays": []interface{}{
+			map[string]interface{}{
+				"width":        int64(s.Config.Width),
+				"height":       int64(s.Config.Height),
+				"uuid":         "e5f7a68d-7b2f-4b3e-b1d1-fd2d5cf74634",
+				"widthPixels":  int64(s.Config.Width),
+				"heightPixels": int64(s.Config.Height),
+				"rotation":     true,
+				"overscanned":  false,
+				"features":     int64(14),
+				"refreshRate":  float64(60.0),
+				"maxFPS":       int64(30),
+			},
+		},
+	}
+}
+
+// handleRTSPSetupBPlist handles AirPlay 2 SETUP with binary plist body.
+// Two-phase protocol per emanuelecozzi.net/docs/airplay2/rtsp/:
+//   Phase 1: Device info + timing protocol → respond with eventPort + timingPort
+//   Phase 2: Stream config (streams array) → respond with dataPort + controlPort
+func (s *Server) handleRTSPSetupBPlist(w io.Writer, req *RTSPRequest) {
+	parsed, err := BPlistDecode(req.Body)
+	if err != nil {
+		log.Printf("RTSP SETUP bplist decode error: %v", err)
+		writeRTSPResponse(w, "400 Bad Request", req.CSeq, nil, "")
+		return
+	}
+
+	setupDict, ok := parsed.(map[string]interface{})
+	if !ok {
+		writeRTSPResponse(w, "400 Bad Request", req.CSeq, nil, "")
+		return
+	}
+
+	log.Printf("RTSP SETUP (bplist): %v", setupDict)
+
+	s.sessionMu.RLock()
+	eventPort := s.eventPort
+	dataPort := s.dataPort
+	s.sessionMu.RUnlock()
+
+	// Phase 1: no "streams" key — device info + timing setup
+	streams, hasStreams := setupDict["streams"].([]interface{})
+	if !hasStreams || len(streams) == 0 {
+		log.Printf("RTSP SETUP phase 1: device info + timing")
+
+		// Extract timing protocol preference
+		timingProto, _ := setupDict["timingProtocol"].(string)
+		log.Printf("RTSP SETUP: timingProtocol=%s", timingProto)
+
+		// Store encryption keys if provided
+		if ekey, ok := setupDict["ekey"]; ok {
+			log.Printf("RTSP SETUP: encryption key provided (%d bytes)", len(fmt.Sprint(ekey)))
+		}
+
+		respDict := map[string]interface{}{
+			"eventPort": int64(eventPort),
+			"timingPort": int64(0), // 0 = PTP (no NTP timing port needed)
+		}
+
+		// If NTP timing requested, provide timing port
+		if timingProto == "NTP" {
+			respDict["timingPort"] = int64(7010)
+		}
+
+		respData, err := BPlistEncode(respDict)
+		if err != nil {
+			writeRTSPResponse(w, "500 Internal Server Error", req.CSeq, nil, "")
+			return
+		}
+		writeRTSPResponse(w, "200 OK", req.CSeq, map[string]string{
+			"Content-Type": "application/x-apple-binary-plist",
+		}, string(respData))
+		return
+	}
+
+	// Phase 2: stream setup
+	stream, _ := streams[0].(map[string]interface{})
+	var streamType int64
+	if t, ok := stream["type"].(int64); ok {
+		streamType = t
+	}
+
+	var respDict map[string]interface{}
+
+	switch streamType {
+	case 110: // Screen mirroring stream
+		log.Printf("RTSP SETUP: screen mirroring stream (type 110)")
+		s.EmitEvent("mirror_setup", map[string]interface{}{"type": streamType})
+		respDict = map[string]interface{}{
+			"streams": []interface{}{
+				map[string]interface{}{
+					"type":     int64(110),
+					"dataPort": int64(s.Config.MirrorPort),
+				},
+			},
+		}
+
+	case 96: // Realtime audio
+		log.Printf("RTSP SETUP: realtime audio stream (type 96)")
+		s.EmitEvent("audio_setup", map[string]interface{}{"type": streamType, "transport": "realtime"})
+		respDict = map[string]interface{}{
+			"streams": []interface{}{
+				map[string]interface{}{
+					"type":        int64(96),
+					"dataPort":    int64(s.Config.AirTunesPort + 1),
+					"controlPort": int64(s.Config.AirTunesPort + 2),
+				},
+			},
+		}
+
+	case 103: // Buffered audio (AirPlay 2)
+		log.Printf("RTSP SETUP: buffered audio stream (type 103)")
+		s.EmitEvent("audio_setup", map[string]interface{}{"type": streamType, "transport": "buffered"})
+		respDict = map[string]interface{}{
+			"streams": []interface{}{
+				map[string]interface{}{
+					"type":        int64(103),
+					"dataPort":    int64(dataPort),
+					"controlPort": int64(s.Config.AirTunesPort + 2),
+				},
+			},
+		}
+
+	default:
+		log.Printf("RTSP SETUP: unknown stream type %d", streamType)
+		respDict = map[string]interface{}{}
+	}
+
+	respData, err := BPlistEncode(respDict)
+	if err != nil {
+		writeRTSPResponse(w, "500 Internal Server Error", req.CSeq, nil, "")
+		return
+	}
+
+	writeRTSPResponse(w, "200 OK", req.CSeq, map[string]string{
+		"Content-Type": "application/x-apple-binary-plist",
+	}, string(respData))
 }

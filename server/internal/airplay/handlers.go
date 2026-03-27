@@ -28,6 +28,7 @@ func (s *Server) buildAirPlayMux() *http.ServeMux {
 	mux.HandleFunc("/setProperty", s.handleSetProperty)
 	mux.HandleFunc("/getProperty", s.handleGetProperty)
 	mux.HandleFunc("/pair-pin-start", s.handlePairPinStart)
+	mux.HandleFunc("/pair-setup-pin", s.handlePairSetup) // PIN-based pair-setup (same handler, TLV format)
 	mux.HandleFunc("/pair-setup", s.handlePairSetup)
 	mux.HandleFunc("/pair-verify", s.handlePairVerify)
 	mux.HandleFunc("/fp-setup", s.handleFPSetup)
@@ -35,18 +36,25 @@ func (s *Server) buildAirPlayMux() *http.ServeMux {
 	mux.HandleFunc("/command", s.handleCommand)
 	mux.HandleFunc("/audioMode", s.handleAudioMode)
 
+	// AirPlay 2 endpoints
+	mux.HandleFunc("/stream", s.handleStream) // POST /stream for AirPlay 2 video
+
 	// Frontend API endpoints (WebSocket + REST)
 	mux.HandleFunc("/api/ws", s.handleWebSocket)
 	mux.HandleFunc("/api/status", s.handleAPIStatus)
 	mux.HandleFunc("/api/photo", s.handleAPIPhoto)
 
-	// CORS middleware wrapper
 	return mux
 }
 
 func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 	log.Printf("GET /server-info from %s", r.RemoteAddr)
 	featLow := uint32(s.Config.Features & 0xFFFFFFFF)
+	featHigh := uint32(s.Config.Features >> 32)
+	featuresStr := fmt.Sprintf("%d", featLow)
+	if featHigh > 0 {
+		featuresStr = fmt.Sprintf("%d", s.Config.Features)
+	}
 	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -54,15 +62,17 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 	<key>deviceid</key>
 	<string>%s</string>
 	<key>features</key>
-	<integer>%d</integer>
+	<integer>%s</integer>
 	<key>model</key>
 	<string>%s</string>
 	<key>protovers</key>
-	<string>1.0</string>
+	<string>1.1</string>
 	<key>srcvers</key>
 	<string>%s</string>
+	<key>statusFlags</key>
+	<integer>%d</integer>
 </dict>
-</plist>`, s.Config.DeviceID, featLow, s.Config.Model, s.Config.SrcVersion)
+</plist>`, s.Config.DeviceID, featuresStr, s.Config.Model, s.Config.SrcVersion, s.Config.StatusFlags)
 
 	w.Header().Set("Content-Type", "text/x-apple-plist+xml")
 	w.Write([]byte(plist))
@@ -70,35 +80,81 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	log.Printf("GET /info from %s", r.RemoteAddr)
+
+	ct := r.Header.Get("Content-Type")
+	// AirPlay 2 clients may send binary plist body with qualifier
+	if r.Body != nil && ct == "application/x-apple-binary-plist" {
+		io.ReadAll(r.Body)
+	}
+
 	info := map[string]interface{}{
 		"deviceid":     s.Config.DeviceID,
-		"features":     s.Config.Features,
+		"features":     int64(s.Config.Features),
 		"model":        s.Config.Model,
 		"protovers":    "1.1",
 		"srcvers":      s.Config.SrcVersion,
 		"name":         s.Config.Name,
-		"statusFlags":  s.Config.StatusFlags,
+		"statusFlags":  int64(s.Config.StatusFlags),
 		"pi":           "b08f5a79-db29-4384-b456-a4784d9e6055",
-		"pk":           "99FD4299889422515FBD27949E4E1E21B2AF50A454499E3D4BE75A4E0F55FE63",
-		"vv":           2,
-		"audioFormats": []map[string]interface{}{
-			{"type": 96, "audioInputFormats": 67108860, "audioOutputFormats": 67108860},
-		},
-		"audioLatencies": []map[string]interface{}{
-			{"type": 96, "audioType": "default", "inputLatencyMicros": 0, "outputLatencyMicros": 400000},
-		},
-		"displays": []map[string]interface{}{
-			{
-				"width":       s.Config.Width,
-				"height":      s.Config.Height,
-				"uuid":        "e5f7a68d-7b2f-4b3e-b1d1-fd2d5cf74634",
-				"widthPixels": s.Config.Width,
-				"heightPixels": s.Config.Height,
-				"rotation":    true,
-				"overscanned": false,
-				"features":    14,
+		"pk":           GetPublicKeyHex(),
+		"vv":           int64(2),
+		"keepAliveLowPower":  int64(1),
+		"keepAliveSendStatsAsBody": int64(1),
+		"initialVolume": float64(-20.0),
+		"audioFormats": []interface{}{
+			map[string]interface{}{
+				"type":               int64(96),
+				"audioInputFormats":  int64(0x01000000), // AAC-ELD
+				"audioOutputFormats": int64(0x01000000),
+			},
+			map[string]interface{}{
+				"type":               int64(103),
+				"audioInputFormats":  int64(0x04000000), // AAC-LC 44100
+				"audioOutputFormats": int64(0x04000000),
 			},
 		},
+		"audioLatencies": []interface{}{
+			map[string]interface{}{
+				"type":                int64(96),
+				"audioType":           "default",
+				"inputLatencyMicros":  int64(0),
+				"outputLatencyMicros": int64(400000),
+			},
+			map[string]interface{}{
+				"type":                int64(103),
+				"audioType":           "default",
+				"inputLatencyMicros":  int64(0),
+				"outputLatencyMicros": int64(400000),
+			},
+		},
+		"displays": []interface{}{
+			map[string]interface{}{
+				"width":                  int64(s.Config.Width),
+				"height":                 int64(s.Config.Height),
+				"uuid":                   "e5f7a68d-7b2f-4b3e-b1d1-fd2d5cf74634",
+				"widthPixels":            int64(s.Config.Width),
+				"heightPixels":           int64(s.Config.Height),
+				"rotation":               true,
+				"overscanned":            false,
+				"features":               int64(14),
+				"widthPhysical":          int64(0),
+				"heightPhysical":         int64(0),
+				"refreshRate":            float64(60.0),
+				"maxFPS":                 int64(30),
+				"primaryInputDevice":     int64(1),
+			},
+		},
+	}
+
+	// Respond with binary plist if client accepts it, else JSON
+	accept := r.Header.Get("Accept")
+	if strings.Contains(accept, "application/x-apple-binary-plist") || ct == "application/x-apple-binary-plist" {
+		data, err := BPlistEncode(info)
+		if err == nil {
+			w.Header().Set("Content-Type", "application/x-apple-binary-plist")
+			w.Write(data)
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(info)
@@ -117,12 +173,33 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse text/parameters format
-	params := parseTextParameters(string(body))
-	url := params["Content-Location"]
-	startPos := 0.0
-	if sp, ok := params["Start-Position"]; ok {
-		startPos, _ = strconv.ParseFloat(strings.TrimSpace(sp), 64)
+	var url string
+	var startPos float64
+
+	ct := r.Header.Get("Content-Type")
+	// AirPlay 2 may send binary plist
+	if ct == "application/x-apple-binary-plist" || (len(body) > 8 && string(body[:8]) == "bplist00") {
+		parsed, perr := BPlistDecode(body)
+		if perr == nil {
+			if m, ok := parsed.(map[string]interface{}); ok {
+				if u, ok := m["Content-Location"].(string); ok {
+					url = u
+				}
+				if sp, ok := m["Start-Position"].(float64); ok {
+					startPos = sp
+				}
+				if sp, ok := m["Start-Position"].(int64); ok {
+					startPos = float64(sp)
+				}
+			}
+		}
+	} else {
+		// AirPlay 1 text/parameters format
+		params := parseTextParameters(string(body))
+		url = params["Content-Location"]
+		if sp, ok := params["Start-Position"]; ok {
+			startPos, _ = strconv.ParseFloat(strings.TrimSpace(sp), 64)
+		}
 	}
 
 	s.Playback.mu.Lock()
@@ -330,4 +407,65 @@ func parseTextParameters(body string) map[string]string {
 		}
 	}
 	return params
+}
+
+// handleStream handles POST /stream for AirPlay 2 video streaming.
+// The client sends a binary plist with stream parameters, then the connection
+// transitions to a raw H.264 binary stream (same as mirror port 7100).
+func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	log.Printf("POST /stream from %s", r.RemoteAddr)
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Bad request", http.StatusBadRequest)
+		return
+	}
+
+	// Parse binary plist stream parameters
+	var streamInfo map[string]interface{}
+	if len(body) > 0 {
+		parsed, perr := BPlistDecode(body)
+		if perr == nil {
+			if m, ok := parsed.(map[string]interface{}); ok {
+				streamInfo = m
+			}
+		}
+	}
+	if streamInfo == nil {
+		streamInfo = make(map[string]interface{})
+	}
+
+	log.Printf("Stream info: sessionID=%v, latencyMs=%v", streamInfo["sessionID"], streamInfo["latencyMs"])
+
+	s.EmitEvent("mirror_start", map[string]interface{}{
+		"width":  s.Config.Width,
+		"height": s.Config.Height,
+		"source": "stream",
+	})
+
+	// Hijack the connection to read raw H.264 stream
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "Hijack not supported", http.StatusInternalServerError)
+		return
+	}
+	conn, bufrw, err := hj.Hijack()
+	if err != nil {
+		log.Printf("Stream hijack error: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	// Send 200 OK
+	bufrw.WriteString("HTTP/1.1 200 OK\r\n\r\n")
+	bufrw.Flush()
+
+	// Read mirror stream packets (same 128-byte header format)
+	s.readMirrorStream(conn)
+
+	s.EmitEvent("mirror_stop", nil)
 }
