@@ -16,7 +16,7 @@ import (
 func main() {
 	name := flag.String("name", "AirPlay Server", "Server display name")
 	port := flag.Int("port", 7000, "AirPlay protocol port")
-	uiPort := flag.Int("ui-port", 8080, "Frontend UI port")
+	uiPort := flag.Int("ui-port", 7777, "Frontend UI port")
 	mirrorPort := flag.Int("mirror-port", 7100, "Mirror port")
 	audioPort := flag.Int("audio-port", 5000, "RTSP/Audio port")
 	width := flag.Int("width", 1920, "Display width")

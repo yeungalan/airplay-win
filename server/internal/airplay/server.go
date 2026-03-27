@@ -97,7 +97,7 @@ func DefaultConfig() ServerConfig {
 		Width:        1920,
 		Height:       1080,
 		PIN:          "",
-		UIPort:       8080,
+		UIPort:       7777,
 		EventPort:    0, // dynamically assigned
 		DataPort:     0, // dynamically assigned
 	}
@@ -178,7 +178,7 @@ func (s *Server) Start() error {
 		errCh <- http.ListenAndServe(addr, mux)
 	}()
 
-	// UI server (port 8080) - frontend + websocket + API
+	// UI server (port 7777) - frontend + websocket + API
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/api/ws", s.handleWebSocket)
