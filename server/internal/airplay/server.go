@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// Feature bits per AirPlay spec
+// Feature bits per AirPlay spec (openairplay.github.io/airplay-spec/features.html)
 const (
 	FeatureVideo                  uint64 = 1 << 0
 	FeaturePhoto                  uint64 = 1 << 1
@@ -25,15 +25,26 @@ const (
 	FeatureScreenRotate           uint64 = 1 << 8
 	FeatureAudio                  uint64 = 1 << 9
 	FeatureAudioRedundant         uint64 = 1 << 11
-	FeaturePhotoCaching           uint64 = 1 << 13
-	FeatureMetadataText           uint64 = 1 << 17
+	FeatureAuthentication4        uint64 = 1 << 14
 	FeatureMetadataArtwork        uint64 = 1 << 15
 	FeatureMetadataProgress       uint64 = 1 << 16
+	FeatureMetadataText           uint64 = 1 << 17
+	FeaturePhotoCaching           uint64 = 1 << 13
+	FeatureAudioFormat1           uint64 = 1 << 18
+	FeatureAudioFormat2           uint64 = 1 << 19 // required for AirPlay 2
+	FeatureAudioFormat3           uint64 = 1 << 20 // required for AirPlay 2
+	FeatureAudioFormat4           uint64 = 1 << 21
+	FeatureHasUnifiedAdvertiser   uint64 = 1 << 26
 	FeatureLegacyPairing          uint64 = 1 << 27
 	FeatureRAOP                   uint64 = 1 << 30
-	FeatureTransientPairing       uint64 = 1 << 48
-	FeatureHKPairingAccessControl uint64 = 1 << 46
+	FeatureSupportsVolume         uint64 = 1 << 32
+	FeatureBufferedAudio          uint64 = 1 << 40 // AirPlay 2 buffered audio
+	FeatureSupportsPTP            uint64 = 1 << 41 // AirPlay 2 PTP clock
+	FeatureScreenMultiCodec       uint64 = 1 << 42
 	FeatureSystemPairing          uint64 = 1 << 43
+	FeatureHKPairingAccessControl uint64 = 1 << 46
+	FeatureTransientPairing       uint64 = 1 << 48
+	FeatureSupportsAirPlayVideoV2 uint64 = 1 << 49
 )
 
 // StatusFlag bits
@@ -45,37 +56,50 @@ const (
 )
 
 type ServerConfig struct {
-	Name       string
-	DeviceID   string // MAC address format
-	Model      string
-	SrcVersion string
-	Features   uint64
-	StatusFlags uint32
-	Port       int
-	MirrorPort int
+	Name         string
+	DeviceID     string // MAC address format
+	Model        string
+	SrcVersion   string
+	Features     uint64
+	StatusFlags  uint32
+	Port         int
+	MirrorPort   int
 	AirTunesPort int
-	Width      int
-	Height     int
-	PIN        string
-	UIPort     int
+	Width        int
+	Height       int
+	PIN          string
+	UIPort       int
+	EventPort    int // AirPlay 2 event data port (UDP)
+	DataPort     int // AirPlay 2 buffered audio data port (UDP)
 }
 
 func DefaultConfig() ServerConfig {
 	return ServerConfig{
 		Name:         "AirPlay Server",
 		DeviceID:     generateMACAddress(),
-		Model:        "AppleTV3,2",
-		SrcVersion:   "220.68",
+		Model:      "AppleTV3,2",
+		SrcVersion: "220.68",
 		// AirPlay 1 feature set: no HAP/homekit pairing bits so iOS connects directly
-		Features:    FeatureVideo | FeaturePhoto | FeatureVideoVolumeControl | FeatureVideoHTTPLiveStreams | FeatureSlideshow | FeatureScreen | FeatureScreenRotate | FeatureAudio | FeatureAudioRedundant | FeaturePhotoCaching | FeatureMetadataText | FeatureMetadataArtwork | FeatureMetadataProgress | FeatureRAOP,
-		StatusFlags: 0x4, // AudioCableAttached only
-		Port:        7000,
-		MirrorPort:  7100,
+		Features: FeatureVideo | FeaturePhoto | FeatureVideoVolumeControl |
+			FeatureVideoHTTPLiveStreams | FeatureSlideshow |
+			FeatureScreen | FeatureScreenRotate |
+			FeatureAudio | FeatureAudioRedundant |
+			FeaturePhotoCaching |
+			FeatureMetadataText | FeatureMetadataArtwork | FeatureMetadataProgress |
+			FeatureAuthentication4 |
+			FeatureAudioFormat1 |
+			FeatureHasUnifiedAdvertiser |
+			FeatureRAOP,
+		StatusFlags:  0x4, // AudioCableAttached only
+		Port:         7000,
+		MirrorPort:   7100,
 		AirTunesPort: 5000,
-		Width:       1920,
-		Height:      1080,
-		PIN:         "",
-		UIPort:      8080,
+		Width:        1920,
+		Height:       1080,
+		PIN:          "",
+		UIPort:       8080,
+		EventPort:    0, // dynamically assigned
+		DataPort:     0, // dynamically assigned
 	}
 }
 
@@ -106,8 +130,14 @@ type Server struct {
 	AudioCh   chan []byte // Audio data
 	EventCh   chan Event  // Events to frontend via WebSocket
 	PairState *PairingState
-	StaticFS  fs.FS       // Embedded frontend files
+	StaticFS  fs.FS // Embedded frontend files
 	stopCh    chan struct{}
+
+	// AirPlay 2 session state
+	sessionMu    sync.RWMutex
+	eventPort    int // bound event data port
+	dataPort     int // bound buffered audio data port
+	activeStream string // "audio", "mirror", or ""
 }
 
 type Event struct {
@@ -176,11 +206,94 @@ func (s *Server) Start() error {
 	// NTP server for time sync (port 7010)
 	go s.startNTPServer()
 
+	// AirPlay 2: start event and data UDP listeners
+	go s.startEventDataPort()
+	go s.startBufferedDataPort()
+
 	return <-errCh
 }
 
 func (s *Server) Stop() {
 	close(s.stopCh)
+}
+
+// startEventDataPort opens a TCP listener for AirPlay 2 event channel.
+// Per protocol spec, the event channel is TCP and must be open for RTSP to proceed.
+// The port is dynamically assigned and reported in SETUP responses.
+func (s *Server) startEventDataPort() {
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		log.Printf("Event port error: %v", err)
+		return
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+	s.sessionMu.Lock()
+	s.eventPort = port
+	s.sessionMu.Unlock()
+	log.Printf("AirPlay 2 event channel (TCP) listening on :%d", port)
+
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		default:
+		}
+		conn, err := listener.Accept()
+		if err != nil {
+			continue
+		}
+		go func(c net.Conn) {
+			defer c.Close()
+			log.Printf("Event channel connection from %s", c.RemoteAddr())
+			buf := make([]byte, 4096)
+			for {
+				c.SetReadDeadline(time.Now().Add(30 * time.Second))
+				n, err := c.Read(buf)
+				if err != nil {
+					return
+				}
+				if n > 0 {
+					log.Printf("Event channel: %d bytes", n)
+				}
+			}
+		}(conn)
+	}
+}
+
+// startBufferedDataPort opens a UDP listener for AirPlay 2 buffered audio data.
+func (s *Server) startBufferedDataPort() {
+	conn, err := net.ListenPacket("udp", ":0")
+	if err != nil {
+		log.Printf("Buffered data port error: %v", err)
+		return
+	}
+	defer conn.Close()
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	s.sessionMu.Lock()
+	s.dataPort = port
+	s.sessionMu.Unlock()
+	log.Printf("AirPlay 2 buffered audio data port listening on :%d", port)
+
+	buf := make([]byte, 65536)
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		default:
+		}
+		conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, _, err := conn.ReadFrom(buf)
+		if err != nil {
+			continue
+		}
+		if n > 0 {
+			select {
+			case s.AudioCh <- append([]byte(nil), buf[:n]...):
+			default:
+			}
+		}
+	}
 }
 
 func (s *Server) startMirrorServer() error {

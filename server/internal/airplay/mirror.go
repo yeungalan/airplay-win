@@ -1,6 +1,7 @@
 package airplay
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -80,6 +81,21 @@ func (s *Server) handleMirrorGET(conn net.Conn, req string) {
 
 func (s *Server) handleMirrorPOST(conn net.Conn, req string, httpBuf []byte) {
 	log.Printf("Mirror POST /stream - starting mirror session")
+
+	// Parse binary plist body from the POST request if present
+	// The body follows the HTTP headers (after \r\n\r\n)
+	headerEnd := bytes.Index(httpBuf, []byte("\r\n\r\n"))
+	if headerEnd >= 0 {
+		body := httpBuf[headerEnd+4:]
+		if len(body) > 0 {
+			parsed, err := BPlistDecode(body)
+			if err == nil {
+				if m, ok := parsed.(map[string]interface{}); ok {
+					log.Printf("Mirror stream params: sessionID=%v latencyMs=%v", m["sessionID"], m["latencyMs"])
+				}
+			}
+		}
+	}
 
 	// Send 200 OK
 	conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
