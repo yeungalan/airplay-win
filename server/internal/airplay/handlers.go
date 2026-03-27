@@ -88,29 +88,21 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	}
 
 	info := map[string]interface{}{
-		"deviceid":     s.Config.DeviceID,
-		"features":     int64(s.Config.Features),
-		"model":        s.Config.Model,
-		"protovers":    "1.1",
-		"srcvers":      s.Config.SrcVersion,
-		"name":         s.Config.Name,
-		"statusFlags":  int64(s.Config.StatusFlags),
-		"pi":           "b08f5a79-db29-4384-b456-a4784d9e6055",
-		"pk":           GetPublicKeyHex(),
-		"vv":           int64(2),
-		"keepAliveLowPower":  int64(1),
+		"deviceid":                 s.Config.DeviceID,
+		"features":                 int64(s.Config.Features),
+		"model":                    s.Config.Model,
+		"protovers":                "1.1",
+		"srcvers":                  s.Config.SrcVersion,
+		"name":                     s.Config.Name,
+		"statusFlags":              int64(s.Config.StatusFlags),
+		"keepAliveLowPower":        int64(1),
 		"keepAliveSendStatsAsBody": int64(1),
-		"initialVolume": float64(-20.0),
+		"initialVolume":            float64(-20.0),
 		"audioFormats": []interface{}{
 			map[string]interface{}{
 				"type":               int64(96),
 				"audioInputFormats":  int64(0x01000000), // AAC-ELD
 				"audioOutputFormats": int64(0x01000000),
-			},
-			map[string]interface{}{
-				"type":               int64(103),
-				"audioInputFormats":  int64(0x04000000), // AAC-LC 44100
-				"audioOutputFormats": int64(0x04000000),
 			},
 		},
 		"audioLatencies": []interface{}{

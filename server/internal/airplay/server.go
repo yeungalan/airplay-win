@@ -1,12 +1,14 @@
 package airplay
 
 import (
+	"crypto/md5"
 	"encoding/binary"
 	"fmt"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 )
@@ -75,8 +77,9 @@ func DefaultConfig() ServerConfig {
 	return ServerConfig{
 		Name:         "AirPlay Server",
 		DeviceID:     generateMACAddress(),
-		Model:        "AppleTV6,2",
-		SrcVersion:   "380.20.1",
+		Model:      "AppleTV3,2",
+		SrcVersion: "220.68",
+		// AirPlay 1 feature set: no HAP/homekit pairing bits so iOS connects directly
 		Features: FeatureVideo | FeaturePhoto | FeatureVideoVolumeControl |
 			FeatureVideoHTTPLiveStreams | FeatureSlideshow |
 			FeatureScreen | FeatureScreenRotate |
@@ -84,37 +87,29 @@ func DefaultConfig() ServerConfig {
 			FeaturePhotoCaching |
 			FeatureMetadataText | FeatureMetadataArtwork | FeatureMetadataProgress |
 			FeatureAuthentication4 |
-			FeatureAudioFormat1 | FeatureAudioFormat2 | FeatureAudioFormat3 |
+			FeatureAudioFormat1 |
 			FeatureHasUnifiedAdvertiser |
-			FeatureLegacyPairing | FeatureRAOP |
-			FeatureSupportsVolume |
-			FeatureBufferedAudio | FeatureSupportsPTP |
-			FeatureScreenMultiCodec |
-			FeatureHKPairingAccessControl | FeatureTransientPairing |
-			FeatureSupportsAirPlayVideoV2,
-		StatusFlags:  0x10644,
+			FeatureRAOP,
+		StatusFlags:  0x4, // AudioCableAttached only
 		Port:         7000,
 		MirrorPort:   7100,
 		AirTunesPort: 5000,
 		Width:        1920,
 		Height:       1080,
-		PIN:          "3939",
-		UIPort:       8080,
+		PIN:          "",
+		UIPort:       7777,
 		EventPort:    0, // dynamically assigned
 		DataPort:     0, // dynamically assigned
 	}
 }
 
+// generateMACAddress returns a stable locally-administered MAC derived from the hostname.
 func generateMACAddress() string {
-	b := make([]byte, 6)
-	b[0] = 0xAA
-	b[1] = 0xBB
-	b[2] = 0xCC
-	t := time.Now().UnixNano()
-	binary.BigEndian.PutUint32(b[2:], uint32(t))
-	b[0] = 0xAA
-	b[1] = 0xBB
-	return fmt.Sprintf("%02X:%02X:%02X:%02X:%02X:%02X", b[0], b[1], b[2], b[3], b[4], b[5])
+	host, _ := os.Hostname()
+	h := md5.Sum([]byte("airplay-win:" + host))
+	// Set locally administered bit, clear multicast bit
+	h[0] = (h[0] | 0x02) & 0xFE
+	return fmt.Sprintf("%02X:%02X:%02X:%02X:%02X:%02X", h[0], h[1], h[2], h[3], h[4], h[5])
 }
 
 type PlaybackState struct {
@@ -183,7 +178,7 @@ func (s *Server) Start() error {
 		errCh <- http.ListenAndServe(addr, mux)
 	}()
 
-	// UI server (port 8080) - frontend + websocket + API
+	// UI server (port 7777) - frontend + websocket + API
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/api/ws", s.handleWebSocket)
