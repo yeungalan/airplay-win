@@ -71,32 +71,23 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	log.Printf("GET /info from %s", r.RemoteAddr)
 	info := map[string]interface{}{
-		"deviceid":     s.Config.DeviceID,
-		"features":     s.Config.Features,
-		"model":        s.Config.Model,
-		"protovers":    "1.1",
-		"srcvers":      s.Config.SrcVersion,
-		"name":         s.Config.Name,
-		"statusFlags":  s.Config.StatusFlags,
-		"pi":           "b08f5a79-db29-4384-b456-a4784d9e6055",
-		"pk":           "99FD4299889422515FBD27949E4E1E21B2AF50A454499E3D4BE75A4E0F55FE63",
-		"vv":           2,
-		"audioFormats": []map[string]interface{}{
-			{"type": 96, "audioInputFormats": 67108860, "audioOutputFormats": 67108860},
-		},
-		"audioLatencies": []map[string]interface{}{
-			{"type": 96, "audioType": "default", "inputLatencyMicros": 0, "outputLatencyMicros": 400000},
-		},
+		"deviceid":    s.Config.DeviceID,
+		"features":    s.Config.Features,
+		"model":       s.Config.Model,
+		"protovers":   "1.1",
+		"srcvers":     s.Config.SrcVersion,
+		"name":        s.Config.Name,
+		"statusFlags": s.Config.StatusFlags,
 		"displays": []map[string]interface{}{
 			{
-				"width":       s.Config.Width,
-				"height":      s.Config.Height,
-				"uuid":        "e5f7a68d-7b2f-4b3e-b1d1-fd2d5cf74634",
-				"widthPixels": s.Config.Width,
+				"width":        s.Config.Width,
+				"height":       s.Config.Height,
+				"uuid":         "e5f7a68d-7b2f-4b3e-b1d1-fd2d5cf74634",
+				"widthPixels":  s.Config.Width,
 				"heightPixels": s.Config.Height,
-				"rotation":    true,
-				"overscanned": false,
-				"features":    14,
+				"rotation":     true,
+				"overscanned":  false,
+				"features":     14,
 			},
 		},
 	}

@@ -18,12 +18,11 @@ type MDNSService struct {
 	StatusFlags  uint32
 	Port         int
 	AirTunesPort int
-	PublicKey    string
 	airplayServer *zeroconf.Server
 	raopServer    *zeroconf.Server
 }
 
-func NewMDNSService(name, deviceID, model, srcVersion, publicKey string, features uint64, statusFlags uint32, port, airTunesPort int) *MDNSService {
+func NewMDNSService(name, deviceID, model, srcVersion string, features uint64, statusFlags uint32, port, airTunesPort int) *MDNSService {
 	return &MDNSService{
 		Name:         name,
 		DeviceID:     deviceID,
@@ -33,7 +32,6 @@ func NewMDNSService(name, deviceID, model, srcVersion, publicKey string, feature
 		StatusFlags:  statusFlags,
 		Port:         port,
 		AirTunesPort: airTunesPort,
-		PublicKey:    publicKey,
 	}
 }
 
@@ -54,15 +52,8 @@ func (m *MDNSService) Start() error {
 		"model=" + m.Model,
 		"srcvers=" + m.SrcVersion,
 		fmt.Sprintf("flags=0x%x", m.StatusFlags),
-		"pk=" + m.PublicKey,
-		"pi=b08f5a79-db29-4384-b456-a4784d9e6055",
-		"gid=b08f5a79-db29-4384-b456-a4784d9e6055",
-		"gcgl=1",
-		"igl=1",
 		"protovers=1.1",
-		"vv=2",
-		"pw=0",
-		"acl=0",
+		"pw=false",
 	}
 
 	m.airplayServer, err = zeroconf.Register(
@@ -85,21 +76,19 @@ func (m *MDNSService) Start() error {
 	raopTXT := []string{
 		"txtvers=1",
 		"ch=2",
-		"cn=0,1,2,3",
+		"cn=0,1",
 		"da=true",
-		"et=0,3,5",
+		"et=0,3",
 		"md=0,1,2",
 		"pw=false",
 		"sv=false",
 		"sr=44100",
 		"ss=16",
 		"tp=UDP",
-		fmt.Sprintf("vn=%d", 65537),
+		"vn=3",
 		"vs=" + m.SrcVersion,
 		"am=" + m.Model,
 		fmt.Sprintf("sf=0x%x", m.StatusFlags),
-		"pk=" + m.PublicKey,
-		"features=" + featStr,
 	}
 
 	m.raopServer, err = zeroconf.Register(

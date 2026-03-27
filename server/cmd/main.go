@@ -45,7 +45,7 @@ func main() {
 
 	mdnsSvc := mdns.NewMDNSService(
 		cfg.Name, cfg.DeviceID, cfg.Model, cfg.SrcVersion,
-		airplay.GetPublicKeyHex(), cfg.Features, cfg.StatusFlags,
+		cfg.Features, cfg.StatusFlags,
 		cfg.Port, cfg.AirTunesPort,
 	)
 	if err := mdnsSvc.Start(); err != nil {
