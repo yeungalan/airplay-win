@@ -1,6 +1,11 @@
 @echo off
 setlocal
 
+echo Switching to development branch...
+git fetch origin
+git checkout claude/setup-airplay-server-yQVwq
+git pull origin claude/setup-airplay-server-yQVwq
+
 echo Building frontend...
 cd frontend
 call npm install

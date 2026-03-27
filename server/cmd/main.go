@@ -21,7 +21,7 @@ func main() {
 	audioPort := flag.Int("audio-port", 5000, "RTSP/Audio port")
 	width := flag.Int("width", 1920, "Display width")
 	height := flag.Int("height", 1080, "Display height")
-	pin := flag.String("pin", "3939", "Pairing PIN")
+	pin := flag.String("pin", "", "Pairing PIN (empty = no PIN required)")
 	flag.Parse()
 
 	cfg := airplay.DefaultConfig()
