@@ -241,7 +241,7 @@ func (s *Server) handleRTSPConnection(conn net.Conn) {
 			})
 			respHeaders = map[string]string{
 				"Transport": fmt.Sprintf("RTP/AVP/UDP;unicast;mode=record;server_port=%d;control_port=%d;timing_port=%d",
-					s.Config.AirTunesPort+1, s.Config.AirTunesPort+2, s.Config.AirTunesPort+3),
+					s.raopDataPort(), s.raopControlPort(), s.raopTimingPort()),
 				"Session":           "1",
 				"Audio-Jack-Status": "connected; type=analog",
 			}

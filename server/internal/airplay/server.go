@@ -138,6 +138,11 @@ type Server struct {
 	eventPort    int // bound event data port
 	dataPort     int // bound buffered audio data port
 	activeStream string // "audio", "mirror", or ""
+
+	// RAOP audio UDP sockets (AirPlay 1)
+	raopDataConn    net.PacketConn // RTP audio data
+	raopControlConn net.PacketConn // RTCP control
+	raopTimingConn  net.PacketConn // NTP timing
 }
 
 type Event struct {
@@ -206,6 +211,9 @@ func (s *Server) Start() error {
 	// NTP server for time sync (port 7010)
 	go s.startNTPServer()
 
+	// RAOP audio UDP ports (AirPlay 1)
+	s.startRAOPServers()
+
 	// AirPlay 2: start event and data UDP listeners
 	go s.startEventDataPort()
 	go s.startBufferedDataPort()
@@ -217,7 +225,108 @@ func (s *Server) Stop() {
 	close(s.stopCh)
 }
 
-// startEventDataPort opens a TCP listener for AirPlay 2 event channel.
+// startRAOPServers opens three UDP sockets for AirPlay 1 audio streaming:
+// data (RTP), control (RTCP), and timing (NTP-style clock sync).
+func (s *Server) startRAOPServers() {
+	var err error
+	s.raopDataConn, err = net.ListenPacket("udp", ":0")
+	if err != nil {
+		log.Printf("RAOP data port error: %v", err)
+	}
+	s.raopControlConn, err = net.ListenPacket("udp", ":0")
+	if err != nil {
+		log.Printf("RAOP control port error: %v", err)
+	}
+	s.raopTimingConn, err = net.ListenPacket("udp", ":0")
+	if err != nil {
+		log.Printf("RAOP timing port error: %v", err)
+	}
+	log.Printf("RAOP UDP ports: data=%d control=%d timing=%d",
+		s.raopDataPort(), s.raopControlPort(), s.raopTimingPort())
+
+	go s.receiveRAOPData()
+	go s.receiveRAOPTiming()
+}
+
+func (s *Server) raopDataPort() int {
+	if s.raopDataConn == nil {
+		return 0
+	}
+	return s.raopDataConn.LocalAddr().(*net.UDPAddr).Port
+}
+
+func (s *Server) raopControlPort() int {
+	if s.raopControlConn == nil {
+		return 0
+	}
+	return s.raopControlConn.LocalAddr().(*net.UDPAddr).Port
+}
+
+func (s *Server) raopTimingPort() int {
+	if s.raopTimingConn == nil {
+		return 0
+	}
+	return s.raopTimingConn.LocalAddr().(*net.UDPAddr).Port
+}
+
+// receiveRAOPData reads incoming RTP audio packets and forwards them to AudioCh.
+func (s *Server) receiveRAOPData() {
+	if s.raopDataConn == nil {
+		return
+	}
+	buf := make([]byte, 4096)
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		default:
+		}
+		s.raopDataConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, _, err := s.raopDataConn.ReadFrom(buf)
+		if err != nil {
+			continue
+		}
+		if n > 12 { // RTP header is 12 bytes minimum
+			select {
+			case s.AudioCh <- append([]byte(nil), buf[12:n]...): // strip RTP header
+			default:
+			}
+		}
+	}
+}
+
+// receiveRAOPTiming responds to NTP-style timing packets from iOS.
+func (s *Server) receiveRAOPTiming() {
+	if s.raopTimingConn == nil {
+		return
+	}
+	buf := make([]byte, 128)
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		default:
+		}
+		s.raopTimingConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, addr, err := s.raopTimingConn.ReadFrom(buf)
+		if err != nil {
+			continue
+		}
+		if n >= 32 {
+			resp := make([]byte, 32)
+			resp[0] = 0x80
+			resp[1] = 0xD3 // timing response type
+			copy(resp[2:4], buf[2:4])   // sequence
+			now := ntpTimestamp(time.Now())
+			copy(resp[8:16], buf[24:32])  // reference = client transmit
+			binary.BigEndian.PutUint64(resp[16:24], now) // receive
+			binary.BigEndian.PutUint64(resp[24:32], now) // transmit
+			s.raopTimingConn.WriteTo(resp, addr)
+		}
+	}
+}
+
+// startEventDataPort opens a TCP listener for AirPlay 2 event channel. opens a TCP listener for AirPlay 2 event channel.
 // Per protocol spec, the event channel is TCP and must be open for RTSP to proceed.
 // The port is dynamically assigned and reported in SETUP responses.
 func (s *Server) startEventDataPort() {

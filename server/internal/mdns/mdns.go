@@ -78,7 +78,7 @@ func (m *MDNSService) Start() error {
 		"ch=2",
 		"cn=0,1",
 		"da=true",
-		"et=0,3",
+		"et=0",
 		"md=0,1,2",
 		"pw=false",
 		"sv=false",
