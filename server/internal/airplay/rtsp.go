@@ -309,6 +309,11 @@ func (s *Server) handleRTSPConnection(conn net.Conn) {
 				}
 			}
 
+		case req.Method == "POST" && strings.HasSuffix(req.URI, "/auth-setup"):
+			// AirPlay 1: FairPlay auth challenge - respond OK with no auth required
+			log.Printf("RTSP auth-setup: responding with no-auth")
+			respHeaders = map[string]string{"Content-Type": "application/octet-stream"}
+
 		case req.Method == "POST" && strings.HasSuffix(req.URI, "/feedback"):
 			// Feedback - just acknowledge
 
